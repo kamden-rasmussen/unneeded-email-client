@@ -1,0 +1,483 @@
+package notify
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/kamden/emailagent/config"
+	"github.com/kamden/emailagent/email"
+)
+
+type Mattermost struct {
+	cfg       config.Mattermost
+	http      *http.Client
+	channelID string
+	botID     string
+}
+
+type Post struct {
+	ID      string
+	UserID  string
+	Message string
+}
+
+// Attachment is a Mattermost message attachment card.
+type Attachment struct {
+	Color   string   `json:"color,omitempty"`
+	Title   string   `json:"title,omitempty"`
+	Text    string   `json:"text,omitempty"`
+	Footer  string   `json:"footer,omitempty"`
+	Actions []Action `json:"actions,omitempty"`
+}
+
+// Action is a button inside an attachment.
+type Action struct {
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	Type        string       `json:"type,omitempty"`
+	Style       string       `json:"style,omitempty"` // "primary", "success", "danger", etc.
+	Integration *Integration `json:"integration,omitempty"`
+}
+
+// Integration holds the callback URL and context for a button action.
+type Integration struct {
+	URL     string         `json:"url"`
+	Context map[string]any `json:"context"`
+}
+
+// DialogElement is a form element in a Mattermost interactive dialog.
+type DialogElement struct {
+	DisplayName string         `json:"display_name"`
+	Name        string         `json:"name"`
+	Type        string         `json:"type"`
+	Options     []SelectOption `json:"options,omitempty"`
+}
+
+// SelectOption is a single option in a dialog select element.
+type SelectOption struct {
+	Text  string `json:"text"`
+	Value string `json:"value"`
+}
+
+func NewMattermost(cfg config.Mattermost) *Mattermost {
+	return &Mattermost{
+		cfg:  cfg,
+		http: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// SendDigest posts the digest. Uses per-email attachment cards with buttons when
+// CallbackURL is configured; otherwise falls back to a plain text message.
+func (m *Mattermost) SendDigest(emails []email.Email) error {
+	header := fmt.Sprintf("### Email Digest — %s", time.Now().Format("Monday, January 2"))
+
+	if len(emails) == 0 {
+		return m.PostMessage(header + "\n\nNo new emails.")
+	}
+
+	if m.cfg.CallbackURL == "" {
+		return m.PostMessage(formatDigest(emails))
+	}
+
+	header += fmt.Sprintf("\n\n**%d new email(s)**  _Reply with `archive 1 2`, `read 3`, `done all` if buttons aren't working_", len(emails))
+
+	atts := make([]Attachment, len(emails))
+	for i, e := range emails {
+		atts[i] = buildEmailAttachment(e, m.cfg.CallbackURL)
+	}
+
+	_, err := m.postWithAttachments(header, atts)
+	return err
+}
+
+func buildEmailAttachment(e email.Email, callbackURL string) Attachment {
+	actionURL := callbackURL + "/actions/email"
+	base := map[string]any{
+		"gmail_id":      strings.TrimPrefix(e.ID, "gmail-"),
+		"account":       e.Account,
+		"email_id":      e.ID,
+		"number":        e.Number,
+		"sender_domain": email.SenderDomain(e.FromAddr),
+	}
+
+	mkCtx := func(action string) map[string]any {
+		ctx := make(map[string]any, len(base)+1)
+		for k, v := range base {
+			ctx[k] = v
+		}
+		ctx["action"] = action
+		return ctx
+	}
+
+	var color string
+	if e.VIP {
+		color = "#FFD700"
+	}
+
+	title := fmt.Sprintf("[%d] %s — %s", e.Number, e.Subject, e.From)
+
+	// Standard actions — suggestion button prepended if available.
+	var acts []Action
+
+	// Action IDs must be alphanumeric only — Mattermost's router rejects dashes/underscores
+	// in the {action_id} path parameter. Use a short verb + the raw hex message ID.
+	hexID := strings.TrimPrefix(e.ID, "gmail-")
+
+	if e.Suggestion != nil {
+		sugCtx := mkCtx("move_direct")
+		sugCtx["label_id"] = e.Suggestion.ID
+		sugCtx["label_name"] = e.Suggestion.Name
+		acts = append(acts, Action{
+			ID:          "sug" + hexID,
+			Name:        "→ " + e.Suggestion.Name,
+			Type:        "button",
+			Style:       "primary",
+			Integration: &Integration{URL: actionURL, Context: sugCtx},
+		})
+	}
+
+	acts = append(acts,
+		Action{
+			ID:          "ar" + hexID,
+			Name:        "Archive",
+			Type:        "button",
+			Integration: &Integration{URL: actionURL, Context: mkCtx("archive")},
+		},
+		Action{
+			ID:          "rd" + hexID,
+			Name:        "Mark Read",
+			Type:        "button",
+			Integration: &Integration{URL: actionURL, Context: mkCtx("mark_read")},
+		},
+		Action{
+			ID:          "mo" + hexID,
+			Name:        "Move...",
+			Type:        "button",
+			Integration: &Integration{URL: actionURL, Context: mkCtx("move")},
+		},
+	)
+
+	att := Attachment{
+		Color:   color,
+		Title:   title,
+		Footer:  fmt.Sprintf("%s · %s", e.Account, relativeTime(e.Date)),
+		Actions: acts,
+	}
+
+	if e.Preview != "" {
+		att.Text = "_" + e.Preview + "_"
+	}
+
+	return att
+}
+
+// PostMessage sends a plain text message to the DM channel.
+func (m *Mattermost) PostMessage(text string) error {
+	return m.createPost(text)
+}
+
+// GetNewMessages returns messages from the user (not the bot) since sinceMillis.
+func (m *Mattermost) GetNewMessages(sinceMillis int64) ([]Post, error) {
+	if err := m.resolveChannelID(); err != nil {
+		return nil, err
+	}
+	if err := m.resolveBotID(); err != nil {
+		return nil, err
+	}
+
+	resp, err := m.apiGet(fmt.Sprintf("/channels/%s/posts?since=%d", m.channelID, sinceMillis))
+	if err != nil {
+		return nil, err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var result struct {
+		Order []string `json:"order"`
+		Posts map[string]struct {
+			ID      string `json:"id"`
+			UserID  string `json:"user_id"`
+			Message string `json:"message"`
+		} `json:"posts"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	var posts []Post
+	for _, id := range result.Order {
+		p := result.Posts[id]
+		if p.UserID == m.botID {
+			continue
+		}
+		posts = append(posts, Post{ID: p.ID, UserID: p.UserID, Message: p.Message})
+	}
+	return posts, nil
+}
+
+// GetPost returns the raw post map for updating attachments.
+func (m *Mattermost) GetPost(postID string) (map[string]any, error) {
+	resp, err := m.apiGet("/posts/" + postID)
+	if err != nil {
+		return nil, err
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	var post map[string]any
+	return post, json.Unmarshal(body, &post)
+}
+
+// PatchPost updates a post's message and attachment props in-place.
+func (m *Mattermost) PatchPost(postID, message string, attachments []any) error {
+	body := map[string]any{
+		"message": message,
+		"props": map[string]any{
+			"attachments": attachments,
+		},
+	}
+	resp, err := m.apiPut("/posts/"+postID+"/patch", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mattermost patch %d: %s", resp.StatusCode, b)
+	}
+	return nil
+}
+
+// OpenDialog opens a Mattermost interactive dialog triggered by a button click.
+func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state string, elements []DialogElement) error {
+	body := map[string]any{
+		"trigger_id": triggerID,
+		"url":        submitURL,
+		"dialog": map[string]any{
+			"callback_id":  callbackID,
+			"title":        title,
+			"state":        state,
+			"submit_label": "Move",
+			"elements":     elements,
+		},
+	}
+	resp, err := m.apiPost("/actions/dialogs/open", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mattermost dialog %d: %s", resp.StatusCode, b)
+	}
+	return nil
+}
+
+func (m *Mattermost) postWithAttachments(message string, atts []Attachment) (string, error) {
+	if err := m.resolveChannelID(); err != nil {
+		return "", err
+	}
+	body := map[string]any{
+		"channel_id": m.channelID,
+		"message":    message,
+		"props": map[string]any{
+			"attachments": atts,
+		},
+	}
+	resp, err := m.apiPost("/posts", body)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("mattermost %d: %s", resp.StatusCode, b)
+	}
+	var post struct {
+		ID string `json:"id"`
+	}
+	json.Unmarshal(b, &post) //nolint:errcheck
+	return post.ID, nil
+}
+
+func (m *Mattermost) createPost(message string) error {
+	if err := m.resolveChannelID(); err != nil {
+		return err
+	}
+	body := map[string]any{
+		"channel_id": m.channelID,
+		"message":    message,
+	}
+	resp, err := m.apiPost("/posts", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("mattermost %d: %s", resp.StatusCode, b)
+	}
+	return nil
+}
+
+func (m *Mattermost) resolveChannelID() error {
+	if m.channelID != "" {
+		return nil
+	}
+	id, err := m.openDMChannel()
+	if err != nil {
+		return fmt.Errorf("opening DM with %q: %w", m.cfg.DMUser, err)
+	}
+	m.channelID = id
+	return nil
+}
+
+func (m *Mattermost) resolveBotID() error {
+	if m.botID != "" {
+		return nil
+	}
+	id, err := m.myUserID()
+	if err != nil {
+		return err
+	}
+	m.botID = id
+	return nil
+}
+
+func (m *Mattermost) openDMChannel() (string, error) {
+	botID, err := m.myUserID()
+	if err != nil {
+		return "", fmt.Errorf("getting bot user ID: %w", err)
+	}
+	targetID, err := m.userIDByUsername(m.cfg.DMUser)
+	if err != nil {
+		return "", fmt.Errorf("getting user ID for %q: %w", m.cfg.DMUser, err)
+	}
+	resp, err := m.apiPost("/channels/direct", []string{botID, targetID})
+	if err != nil {
+		return "", err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("mattermost %d: %s", resp.StatusCode, body)
+	}
+	var ch struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &ch); err != nil || ch.ID == "" {
+		return "", fmt.Errorf("unexpected response: %s", body)
+	}
+	return ch.ID, nil
+}
+
+func (m *Mattermost) myUserID() (string, error) {
+	resp, err := m.apiGet("/users/me")
+	if err != nil {
+		return "", err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var u struct {
+		ID string `json:"id"`
+	}
+	return u.ID, json.Unmarshal(body, &u)
+}
+
+func (m *Mattermost) userIDByUsername(username string) (string, error) {
+	resp, err := m.apiGet("/users/username/" + username)
+	if err != nil {
+		return "", err
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("user %q not found", username)
+	}
+	var u struct {
+		ID string `json:"id"`
+	}
+	return u.ID, json.Unmarshal(body, &u)
+}
+
+func (m *Mattermost) apiPost(path string, body any) (*http.Response, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", m.cfg.ServerURL+"/api/v4"+path, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+m.cfg.BotToken)
+	req.Header.Set("Content-Type", "application/json")
+	return m.http.Do(req)
+}
+
+func (m *Mattermost) apiGet(path string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", m.cfg.ServerURL+"/api/v4"+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+m.cfg.BotToken)
+	return m.http.Do(req)
+}
+
+func (m *Mattermost) apiPut(path string, body any) (*http.Response, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("PUT", m.cfg.ServerURL+"/api/v4"+path, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+m.cfg.BotToken)
+	req.Header.Set("Content-Type", "application/json")
+	return m.http.Do(req)
+}
+
+// formatDigest produces a plain-text digest (used when CallbackURL is not set).
+func formatDigest(emails []email.Email) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("### Email Digest — %s\n\n", time.Now().Format("Monday, January 2")))
+
+	if len(emails) == 0 {
+		sb.WriteString("No new emails.")
+		return sb.String()
+	}
+
+	sb.WriteString(fmt.Sprintf("**%d new email(s)**\n\n", len(emails)))
+
+	for _, e := range emails {
+		sb.WriteString(fmt.Sprintf("**[%d]** **%s** · %s\n", e.Number, e.From, e.Subject))
+		if e.Preview != "" {
+			sb.WriteString(fmt.Sprintf("_%s_\n", e.Preview))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("---\n")
+	sb.WriteString("_Commands: `archive 1 2` · `read 3` · `done 4` · `archive all`_")
+	return sb.String()
+}
+
+func relativeTime(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	now := time.Now()
+	ay, am, ad := t.Date()
+	by, bm, bd := now.Date()
+	if ay == by && am == bm && ad == bd {
+		return t.Format("3:04 PM")
+	}
+	return t.Format("Jan 2")
+}

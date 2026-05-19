@@ -1,0 +1,57 @@
+# Senders that always appear at the top of your digest
+vip_senders:
+  - boss@company.com
+  - family@example.com
+
+# Drop emails from these senders silently
+mute_senders:
+  - noreply@marketing.com
+  - no-reply@newsletter.com
+
+# Drop emails whose subjects contain these strings
+mute_subjects:
+  - unsubscribe
+  - weekly digest
+
+# Category rules — first match wins
+categories:
+  - name: Finance
+    keywords:
+      - invoice
+      - receipt
+      - payment
+      - billing
+      - bank statement
+      - transaction
+
+  - name: Engineering
+    senders:
+      - github.com
+      - gitlab.com
+      - circleci.com
+      - jira
+    keywords:
+      - pull request
+      - build failed
+      - deployment
+      - alert
+
+  - name: Meetings
+    keywords:
+      - meeting
+      - calendar invite
+      - zoom
+      - google meet
+      - has been scheduled
+
+  - name: Newsletters
+    keywords:
+      - newsletter
+      - unsubscribe
+      - weekly update
+      - monthly digest
+      - this week in
+
+digest:
+  vip_first: true
+  max_preview_length: 150

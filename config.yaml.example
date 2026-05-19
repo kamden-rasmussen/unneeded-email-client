@@ -1,0 +1,25 @@
+accounts:
+  - name: gmail
+    type: gmail
+    email: you@gmail.com
+    credentials_file: credentials.json
+    token_file: gmail_token.json
+
+mattermost:
+  bot_token: xxxxxxxxxxxxxxxxxxxxxxxxxxxx   # Bot token from Mattermost
+  server_url: https://your.mattermost.com  # No trailing slash
+  dm_user: your_mattermost_username
+  username: Email Agent
+  callback_url: http://YOUR_SERVER_IP:8090  # How Mattermost reaches this machine
+  port: 8090                                # Port this agent listens on
+
+schedule: "0 7 * * *"
+
+database: email_agent.db
+
+poll_interval: 30
+
+ollama:
+  enabled: false
+  host: http://localhost:11434
+  model: gemma4:latest

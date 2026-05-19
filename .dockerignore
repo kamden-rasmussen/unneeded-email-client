@@ -1,0 +1,6 @@
+credentials.json
+gmail_token.json
+*.db
+config.yaml
+preferences.yaml
+email-agent

@@ -1,0 +1,13 @@
+# Sensitive credentials — never commit these
+credentials.json
+gmail_token.json
+*_token.json
+
+# Live config contains webhook URLs and email addresses
+config.yaml
+
+# Database
+*.db
+
+# Compiled binary
+email-agent
