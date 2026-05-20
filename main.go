@@ -29,6 +29,12 @@ var (
 )
 
 func main() {
+	// auth subcommand must be checked before flag.Parse so it can have its own args.
+	if len(os.Args) > 1 && os.Args[1] == "auth" {
+		runAuth(os.Args[2:])
+		return
+	}
+
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -54,10 +60,11 @@ func main() {
 	// Start the HTTP action server for Mattermost button callbacks.
 	if cfg.Mattermost.CallbackURL != "" {
 		ah := &actions.Handler{
-			Clients:     actionClients,
-			MMClient:    notifier,
-			CallbackURL: cfg.Mattermost.CallbackURL,
-			DB:          db,
+			Clients:       actionClients,
+			MMClient:      notifier,
+			CallbackURL:   cfg.Mattermost.CallbackURL,
+			DB:            db,
+			WebhookSecret: cfg.Mattermost.WebhookSecret,
 		}
 		mux := http.NewServeMux()
 		ah.Register(mux)
@@ -76,17 +83,17 @@ func main() {
 
 	suggesters := buildSuggesters(actionClients)
 
-	run := func() {
-		if err := digest(cfg, db, processor, notifier, suggesters); err != nil {
-			log.Printf("digest error: %v", err)
-		}
+	run := func() error {
+		return digest(cfg, db, processor, notifier, suggesters)
 	}
 
 	// Start poll loop — watches DM channel for text commands like "archive 1 2"
-	go pollLoop(cfg, db, actionClients, notifier)
+	go pollLoop(cfg, db, actionClients, notifier, run)
 
 	if *runNow {
-		run()
+		if err := run(); err != nil {
+			log.Printf("digest error: %v", err)
+		}
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		log.Println("digest sent — polling for commands (Ctrl+C to quit)")
@@ -95,7 +102,11 @@ func main() {
 	}
 
 	c := cron.New()
-	if _, err := c.AddFunc(cfg.Schedule, run); err != nil {
+	if _, err := c.AddFunc(cfg.Schedule, func() {
+		if err := run(); err != nil {
+			log.Printf("digest error: %v", err)
+		}
+	}); err != nil {
 		log.Fatalf("invalid schedule %q: %v", cfg.Schedule, err)
 	}
 	c.Start()
@@ -184,7 +195,7 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 			Number:  i + 1,
 			EmailID: newEmails[i].ID,
 			Account: newEmails[i].Account,
-			GmailID: strings.TrimPrefix(newEmails[i].ID, "gmail-"),
+			MsgID:   newEmails[i].MsgID,
 			Subject: newEmails[i].Subject,
 			From:    newEmails[i].From,
 		}
@@ -238,10 +249,18 @@ func buildSuggesters(clients map[string]email.Actioner) map[string]email.Suggest
 func buildActionClients(accounts []config.Account) map[string]email.Actioner {
 	clients := make(map[string]email.Actioner)
 	for _, acc := range accounts {
-		if acc.Type != "gmail" {
+		var (
+			c   email.Actioner
+			err error
+		)
+		switch acc.Type {
+		case "gmail":
+			c, err = email.NewGmailClient(acc)
+		case "imap":
+			c, err = email.NewIMAPClient(acc)
+		default:
 			continue
 		}
-		c, err := email.NewGmailClient(acc)
 		if err != nil {
 			log.Printf("action client for %s: %v", acc.Name, err)
 			continue
@@ -252,22 +271,26 @@ func buildActionClients(accounts []config.Account) map[string]email.Actioner {
 }
 
 // pollLoop checks the DM channel on an interval for commands from the user.
-func pollLoop(cfg *config.Config, db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost) {
+func pollLoop(cfg *config.Config, db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost, digestFn func() error) {
 	interval := time.Duration(cfg.PollInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if err := processPoll(db, clients, mm); err != nil {
+		if err := processPoll(db, clients, mm, digestFn); err != nil {
 			log.Printf("poll: %v", err)
 		}
 	}
 }
 
-func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost) error {
+func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost, digestFn func() error) error {
 	cursor, err := db.GetPollCursor()
-	if err != nil || cursor == 0 {
-		return err // no digest sent yet
+	if err != nil {
+		return err
+	}
+	if cursor == 0 {
+		// First startup — set cursor to now so we start listening immediately.
+		return db.SetPollCursor(time.Now().UnixMilli())
 	}
 
 	messages, err := mm.GetNewMessages(cursor)
@@ -278,7 +301,7 @@ func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.M
 	now := time.Now().UnixMilli()
 
 	for _, msg := range messages {
-		reply, err := executeCommand(strings.TrimSpace(msg.Message), db, clients)
+		reply, err := executeCommand(strings.TrimSpace(msg.Message), db, clients, digestFn)
 		if err != nil {
 			log.Printf("command %q: %v", msg.Message, err)
 			mm.PostMessage("Error: " + err.Error()) //nolint:errcheck
@@ -292,14 +315,23 @@ func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.M
 	return db.SetPollCursor(now)
 }
 
-// executeCommand parses and runs a command like "archive 1 3" or "read 2" or "done all".
-func executeCommand(text string, db *storage.DB, clients map[string]email.Actioner) (string, error) {
+// executeCommand parses and runs a command like "archive 1 3", "read 2", "done all", or "check".
+func executeCommand(text string, db *storage.DB, clients map[string]email.Actioner, digestFn func() error) (string, error) {
 	fields := strings.Fields(strings.ToLower(text))
-	if len(fields) < 2 {
+	if len(fields) == 0 {
 		return "", nil
 	}
 
 	action := fields[0]
+
+	if action == "check" || action == "digest" {
+		return "", digestFn()
+	}
+
+	if len(fields) < 2 {
+		return "", nil
+	}
+
 	if action != "archive" && action != "read" && action != "done" {
 		return "", nil // not a command we recognise, ignore
 	}
@@ -338,16 +370,16 @@ func executeCommand(text string, db *storage.DB, clients map[string]email.Action
 		}
 		switch action {
 		case "archive":
-			if err := client.Archive(e.GmailID); err != nil {
+			if err := client.Archive(e.MsgID); err != nil {
 				return "", fmt.Errorf("archiving [%d]: %w", e.Number, err)
 			}
 		case "read":
-			if err := client.MarkRead(e.GmailID); err != nil {
+			if err := client.MarkRead(e.MsgID); err != nil {
 				return "", fmt.Errorf("marking read [%d]: %w", e.Number, err)
 			}
 		case "done":
-			client.Archive(e.GmailID)   //nolint:errcheck
-			client.MarkRead(e.GmailID) //nolint:errcheck
+			client.Archive(e.MsgID)  //nolint:errcheck
+			client.MarkRead(e.MsgID) //nolint:errcheck
 		}
 		done = append(done, fmt.Sprintf("[%d] %s — %s", e.Number, e.From, e.Subject))
 	}
@@ -358,4 +390,32 @@ func executeCommand(text string, db *storage.DB, clients map[string]email.Action
 
 	verb := map[string]string{"archive": "Archived", "read": "Marked read", "done": "Done"}[action]
 	return fmt.Sprintf("%s ✓\n%s", verb, strings.Join(done, "\n")), nil
+}
+
+// runAuth handles the `email-agent auth [--port N] <type> <name>` subcommand.
+func runAuth(args []string) {
+	fs := flag.NewFlagSet("auth", flag.ExitOnError)
+	port := fs.Int("port", 0, "fixed callback port (use with SSH tunneling or Docker: -L <port>:localhost:<port>)")
+	fs.Parse(args) //nolint:errcheck
+	rest := fs.Args()
+
+	if len(rest) < 2 {
+		log.Fatal("usage: email-agent auth [--port N] gmail <account-name>")
+	}
+	accountType, name := rest[0], rest[1]
+
+	switch accountType {
+	case "gmail":
+		tokenFile := name + "_token.json"
+		fmt.Printf("Authenticating Gmail account %q — token will be saved to %s\n", name, tokenFile)
+		if *port > 0 {
+			fmt.Printf("Listening on port %d (forward this port if on a remote machine)\n", *port)
+		}
+		if err := email.RunGmailAuth(tokenFile, *port); err != nil {
+			log.Fatalf("auth: %v", err)
+		}
+		fmt.Printf("\nAdd this to your config.yaml:\n\n  - name: %s\n    type: gmail\n    email: you@gmail.com\n", name)
+	default:
+		log.Fatalf("unknown account type %q — supported: gmail", accountType)
+	}
 }

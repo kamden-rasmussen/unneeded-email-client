@@ -24,7 +24,7 @@ type DigestEmail struct {
 	Number  int
 	EmailID string
 	Account string
-	GmailID string
+	MsgID   string
 	Subject string
 	From    string
 }
@@ -49,7 +49,7 @@ func Open(path string) (*DB, error) {
 			number    INTEGER PRIMARY KEY,
 			email_id  TEXT NOT NULL,
 			account   TEXT NOT NULL,
-			gmail_id  TEXT NOT NULL,
+			msg_id    TEXT NOT NULL,
 			subject   TEXT NOT NULL,
 			from_name TEXT NOT NULL
 		)`,
@@ -70,6 +70,8 @@ func Open(path string) (*DB, error) {
 			return nil, fmt.Errorf("schema: %w", err)
 		}
 	}
+	// one-time migration: rename msg_id → msg_id (ignore error if already renamed)
+	db.Exec("ALTER TABLE digest_emails RENAME COLUMN msg_id TO msg_id")
 
 	return &DB{db: db}, nil
 }
@@ -118,8 +120,8 @@ func (d *DB) SaveDigestEmails(emails []DigestEmail) error {
 	}
 	for _, e := range emails {
 		if _, err := tx.Exec(
-			"INSERT INTO digest_emails (number, email_id, account, gmail_id, subject, from_name) VALUES (?, ?, ?, ?, ?, ?)",
-			e.Number, e.EmailID, e.Account, e.GmailID, e.Subject, e.From,
+			"INSERT INTO digest_emails (number, email_id, account, msg_id, subject, from_name) VALUES (?, ?, ?, ?, ?, ?)",
+			e.Number, e.EmailID, e.Account, e.MsgID, e.Subject, e.From,
 		); err != nil {
 			return err
 		}
@@ -130,15 +132,15 @@ func (d *DB) SaveDigestEmails(emails []DigestEmail) error {
 func (d *DB) GetDigestEmail(number int) (DigestEmail, error) {
 	var e DigestEmail
 	err := d.db.QueryRow(
-		"SELECT number, email_id, account, gmail_id, subject, from_name FROM digest_emails WHERE number = ?",
+		"SELECT number, email_id, account, msg_id, subject, from_name FROM digest_emails WHERE number = ?",
 		number,
-	).Scan(&e.Number, &e.EmailID, &e.Account, &e.GmailID, &e.Subject, &e.From)
+	).Scan(&e.Number, &e.EmailID, &e.Account, &e.MsgID, &e.Subject, &e.From)
 	return e, err
 }
 
 func (d *DB) GetAllDigestEmails() ([]DigestEmail, error) {
 	rows, err := d.db.Query(
-		"SELECT number, email_id, account, gmail_id, subject, from_name FROM digest_emails ORDER BY number",
+		"SELECT number, email_id, account, msg_id, subject, from_name FROM digest_emails ORDER BY number",
 	)
 	if err != nil {
 		return nil, err
@@ -148,7 +150,7 @@ func (d *DB) GetAllDigestEmails() ([]DigestEmail, error) {
 	var emails []DigestEmail
 	for rows.Next() {
 		var e DigestEmail
-		if err := rows.Scan(&e.Number, &e.EmailID, &e.Account, &e.GmailID, &e.Subject, &e.From); err != nil {
+		if err := rows.Scan(&e.Number, &e.EmailID, &e.Account, &e.MsgID, &e.Subject, &e.From); err != nil {
 			return nil, err
 		}
 		emails = append(emails, e)

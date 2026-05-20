@@ -2,6 +2,8 @@ package email
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -15,29 +17,45 @@ type IMAPClient struct {
 }
 
 func NewIMAPClient(acc config.Account) (*IMAPClient, error) {
+	c, err := dialIMAP(acc)
+	if err != nil {
+		return nil, err
+	}
+	return &IMAPClient{cfg: acc, c: c}, nil
+}
+
+func dialIMAP(acc config.Account) (*client.Client, error) {
 	port := acc.Port
 	if port == 0 {
 		port = 993
 	}
 	addr := fmt.Sprintf("%s:%d", acc.Host, port)
-
 	c, err := client.DialTLS(addr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to %s: %w", addr, err)
 	}
-
 	if err := c.Login(acc.Email, acc.Password); err != nil {
 		c.Logout()
 		return nil, fmt.Errorf("login %s: %w", acc.Name, err)
 	}
+	return c, nil
+}
 
-	return &IMAPClient{cfg: acc, c: c}, nil
+func (ic *IMAPClient) reconnect() error {
+	if ic.c != nil {
+		ic.c.Logout()
+	}
+	c, err := dialIMAP(ic.cfg)
+	if err != nil {
+		return err
+	}
+	ic.c = c
+	return nil
 }
 
 func (ic *IMAPClient) Name() string { return ic.cfg.Name }
 
 func (ic *IMAPClient) FetchNew(since time.Time) ([]Email, error) {
-	// read-only select to avoid marking messages as seen
 	if _, err := ic.c.Select("INBOX", true); err != nil {
 		return nil, fmt.Errorf("select inbox: %w", err)
 	}
@@ -67,11 +85,13 @@ func (ic *IMAPClient) FetchNew(since time.Time) ([]Email, error) {
 		if msg.Envelope == nil {
 			continue
 		}
+		uidStr := strconv.FormatUint(uint64(msg.Uid), 10)
 		e := Email{
-			ID:      fmt.Sprintf("imap-%s-%d", ic.cfg.Name, msg.Uid),
+			ID:      fmt.Sprintf("imap-%s-%s", ic.cfg.Name, uidStr),
+			MsgID:   uidStr,
 			Account: ic.cfg.Name,
-			Subject: msg.Envelope.Subject,
 			Date:    msg.Envelope.Date,
+			Subject: msg.Envelope.Subject,
 		}
 		if len(msg.Envelope.From) > 0 {
 			from := msg.Envelope.From[0]
@@ -90,4 +110,78 @@ func (ic *IMAPClient) FetchNew(since time.Time) ([]Email, error) {
 
 func (ic *IMAPClient) Close() error {
 	return ic.c.Logout()
+}
+
+func (ic *IMAPClient) Archive(msgID string) error {
+	archiveMailbox := ic.cfg.ArchiveMailbox
+	if archiveMailbox == "" {
+		archiveMailbox = "Archive"
+	}
+	return ic.moveUID(msgID, archiveMailbox)
+}
+
+func (ic *IMAPClient) MarkRead(msgID string) error {
+	if err := ic.reconnect(); err != nil {
+		return err
+	}
+	if _, err := ic.c.Select("INBOX", false); err != nil {
+		return fmt.Errorf("select inbox: %w", err)
+	}
+	uid, err := strconv.ParseUint(msgID, 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid uid %q: %w", msgID, err)
+	}
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(uint32(uid))
+	return ic.c.UidStore(seqset, imap.FormatFlagsOp(imap.AddFlags, true), []interface{}{imap.SeenFlag}, nil)
+}
+
+func (ic *IMAPClient) MoveToLabel(msgID, mailbox string) error {
+	return ic.moveUID(msgID, mailbox)
+}
+
+func (ic *IMAPClient) ListLabels() ([]Label, error) {
+	if err := ic.reconnect(); err != nil {
+		return nil, err
+	}
+
+	mailboxes := make(chan *imap.MailboxInfo, 20)
+	done := make(chan error, 1)
+	go func() {
+		done <- ic.c.List("", "*", mailboxes)
+	}()
+
+	skip := map[string]bool{
+		"inbox": true, "drafts": true, "sent": true,
+		"sent messages": true, "deleted messages": true,
+		"trash": true, "junk": true, "spam": true,
+	}
+
+	var labels []Label
+	for m := range mailboxes {
+		if skip[strings.ToLower(m.Name)] {
+			continue
+		}
+		labels = append(labels, Label{ID: m.Name, Name: m.Name})
+	}
+	return labels, <-done
+}
+
+func (ic *IMAPClient) moveUID(msgID, destMailbox string) error {
+	if err := ic.reconnect(); err != nil {
+		return err
+	}
+	if _, err := ic.c.Select("INBOX", false); err != nil {
+		return fmt.Errorf("select inbox: %w", err)
+	}
+	uid, err := strconv.ParseUint(msgID, 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid uid %q: %w", msgID, err)
+	}
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(uint32(uid))
+	if err := ic.c.UidCopy(seqset, destMailbox); err != nil {
+		return fmt.Errorf("copy to %s: %w", destMailbox, err)
+	}
+	return ic.c.UidStore(seqset, imap.FormatFlagsOp(imap.AddFlags, true), []interface{}{imap.DeletedFlag}, nil)
 }

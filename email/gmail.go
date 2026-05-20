@@ -19,6 +19,20 @@ import (
 	"github.com/kamden/emailagent/config"
 )
 
+const (
+	gmailClientID     = "195489124467-gp35qrirjndsrgkj7rndg6pme6itj59s.apps.googleusercontent.com"
+	gmailClientSecret = "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"
+)
+
+func gmailOAuthConfig() *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     gmailClientID,
+		ClientSecret: gmailClientSecret,
+		Scopes:       []string{gmail.GmailModifyScope},
+		Endpoint:     google.Endpoint,
+	}
+}
+
 type GmailClient struct {
 	cfg    config.Account
 	svc    *gmail.Service
@@ -26,17 +40,12 @@ type GmailClient struct {
 }
 
 func NewGmailClient(acc config.Account) (*GmailClient, error) {
-	b, err := os.ReadFile(acc.CredentialsFile)
-	if err != nil {
-		return nil, fmt.Errorf("reading credentials %s: %w", acc.CredentialsFile, err)
+	tokenFile := acc.TokenFile
+	if tokenFile == "" {
+		tokenFile = acc.Name + "_token.json"
 	}
 
-	oauthCfg, err := google.ConfigFromJSON(b, gmail.GmailModifyScope)
-	if err != nil {
-		return nil, fmt.Errorf("parsing credentials: %w", err)
-	}
-
-	httpClient, err := oauthHTTPClient(oauthCfg, acc.TokenFile)
+	httpClient, err := oauthHTTPClient(gmailOAuthConfig(), tokenFile)
 	if err != nil {
 		return nil, fmt.Errorf("oauth for %s: %w", acc.Name, err)
 	}
@@ -79,6 +88,7 @@ func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {
 
 			e := Email{
 				ID:      "gmail-" + m.Id,
+				MsgID:   m.Id,
 				Account: g.cfg.Name,
 				Preview: msg.Snippet,
 			}
@@ -111,8 +121,8 @@ func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {
 
 func (g *GmailClient) Close() error { return nil }
 
-func (g *GmailClient) MoveToLabel(gmailMsgID, labelID string) error {
-	_, err := g.svc.Users.Messages.Modify("me", gmailMsgID, &gmail.ModifyMessageRequest{
+func (g *GmailClient) MoveToLabel(msgID, labelID string) error {
+	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
 		AddLabelIds:    []string{labelID},
 		RemoveLabelIds: []string{"INBOX"},
 	}).Do()
@@ -196,15 +206,15 @@ func (g *GmailClient) InferLabel(senderDomain string) (*Label, error) {
 	return nil, nil
 }
 
-func (g *GmailClient) Archive(gmailMsgID string) error {
-	_, err := g.svc.Users.Messages.Modify("me", gmailMsgID, &gmail.ModifyMessageRequest{
+func (g *GmailClient) Archive(msgID string) error {
+	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
 		RemoveLabelIds: []string{"INBOX"},
 	}).Do()
 	return err
 }
 
-func (g *GmailClient) MarkRead(gmailMsgID string) error {
-	_, err := g.svc.Users.Messages.Modify("me", gmailMsgID, &gmail.ModifyMessageRequest{
+func (g *GmailClient) MarkRead(msgID string) error {
+	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
 		RemoveLabelIds: []string{"UNREAD"},
 	}).Do()
 	return err
@@ -214,7 +224,7 @@ func (g *GmailClient) MarkRead(gmailMsgID string) error {
 func oauthHTTPClient(cfg *oauth2.Config, tokenFile string) (*http.Client, error) {
 	tok, err := loadToken(tokenFile)
 	if err != nil {
-		tok, err = browserAuthFlow(cfg)
+		tok, err = browserAuthFlow(cfg, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -237,12 +247,18 @@ func loadToken(file string) (*oauth2.Token, error) {
 
 // browserAuthFlow starts a local HTTP server, opens the browser for consent,
 // waits for Google to redirect back with the auth code, then exchanges it.
-func browserAuthFlow(cfg *oauth2.Config) (*oauth2.Token, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+// port fixes the listener port; pass 0 to pick a random available port.
+func browserAuthFlow(cfg *oauth2.Config, port int) (*oauth2.Token, error) {
+	addr := "127.0.0.1:0"
+	if port > 0 {
+		// Bind on all interfaces so Docker port mapping and SSH tunnels work.
+		addr = fmt.Sprintf("0.0.0.0:%d", port)
+	}
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("starting local listener: %w", err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
+	port = ln.Addr().(*net.TCPAddr).Port
 
 	// Google Desktop-app credentials accept any localhost port.
 	cfg.RedirectURL = fmt.Sprintf("http://127.0.0.1:%d", port)
@@ -275,9 +291,10 @@ func browserAuthFlow(cfg *oauth2.Config) (*oauth2.Token, error) {
 	defer srv.Close()
 
 	fmt.Printf("Opening browser for Gmail authorization...\n")
-	if err := exec.Command("open", authURL).Run(); err != nil {
-		fmt.Printf("Could not open browser automatically.\nVisit this URL:\n%s\n", authURL)
+	if exec.Command("xdg-open", authURL).Start() != nil {
+		exec.Command("open", authURL).Start() //nolint:errcheck
 	}
+	fmt.Printf("If the browser did not open, visit:\n%s\n", authURL)
 
 	select {
 	case code := <-codeCh:
@@ -291,6 +308,20 @@ func browserAuthFlow(cfg *oauth2.Config) (*oauth2.Token, error) {
 	case <-time.After(5 * time.Minute):
 		return nil, fmt.Errorf("authorization timed out")
 	}
+}
+
+// RunGmailAuth runs the OAuth2 browser flow and saves the token to tokenFile.
+// port fixes the callback listener port (useful for SSH tunneling); 0 picks a random port.
+func RunGmailAuth(tokenFile string, port int) error {
+	tok, err := browserAuthFlow(gmailOAuthConfig(), port)
+	if err != nil {
+		return err
+	}
+	if err := saveToken(tokenFile, tok); err != nil {
+		return err
+	}
+	fmt.Printf("Token saved to %s\n", tokenFile)
+	return nil
 }
 
 func saveToken(path string, tok *oauth2.Token) error {

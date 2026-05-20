@@ -23,17 +23,18 @@ type Account struct {
 	Host            string `yaml:"host"`
 	Port            int    `yaml:"port"`
 	Password        string `yaml:"password"`
-	CredentialsFile string `yaml:"credentials_file"`
-	TokenFile       string `yaml:"token_file"`
+	ArchiveMailbox  string `yaml:"archive_mailbox"` // IMAP only; defaults to "Archive"
+	TokenFile string `yaml:"token_file"`
 }
 
 type Mattermost struct {
-	BotToken    string `yaml:"bot_token"`
-	ServerURL   string `yaml:"server_url"`
-	DMUser      string `yaml:"dm_user"`
-	Username    string `yaml:"username"`
-	CallbackURL string `yaml:"callback_url"` // base URL Mattermost can reach us at, e.g. http://10.10.0.14:8090
-	Port        int    `yaml:"port"`          // local port to listen on, default 8090
+	BotToken      string `yaml:"bot_token"`
+	ServerURL     string `yaml:"server_url"`
+	DMUser        string `yaml:"dm_user"`
+	Username      string `yaml:"username"`
+	CallbackURL   string `yaml:"callback_url"`   // base URL Mattermost can reach us at, e.g. https://email-agent.example.com
+	Port          int    `yaml:"port"`            // local port to listen on, default 8090
+	WebhookSecret string `yaml:"webhook_secret"` // shared secret embedded in action contexts; required when callback_url is set
 }
 
 type Ollama struct {
@@ -90,6 +91,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Mattermost.Port == 0 {
 		cfg.Mattermost.Port = 8090
+	}
+	if cfg.Mattermost.CallbackURL != "" && cfg.Mattermost.WebhookSecret == "" {
+		return nil, fmt.Errorf("mattermost.webhook_secret is required when callback_url is set")
 	}
 
 	return &cfg, nil

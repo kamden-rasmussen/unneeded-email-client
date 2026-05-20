@@ -1,11 +1,12 @@
 package actions
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
+	"strconv"
 
 	"github.com/kamden/emailagent/email"
 	"github.com/kamden/emailagent/notify"
@@ -14,10 +15,11 @@ import (
 
 // Handler handles Mattermost interactive button callbacks and dialog submissions.
 type Handler struct {
-	Clients     map[string]email.Actioner
-	MMClient    *notify.Mattermost
-	CallbackURL string
-	DB          *storage.DB // for recording user-confirmed sender→label mappings
+	Clients       map[string]email.Actioner
+	MMClient      *notify.Mattermost
+	CallbackURL   string
+	DB            *storage.DB // for recording user-confirmed sender→label mappings
+	WebhookSecret string
 }
 
 // Register wires up HTTP routes on mux.
@@ -35,14 +37,15 @@ type buttonPayload struct {
 }
 
 type actionContext struct {
-	Action       string `json:"action"`
-	GmailID      string `json:"gmail_id"`
-	Account      string `json:"account"`
-	EmailID      string `json:"email_id"`
-	Number       int    `json:"number"`
-	LabelID      string `json:"label_id,omitempty"`
-	LabelName    string `json:"label_name,omitempty"`
-	SenderDomain string `json:"sender_domain,omitempty"`
+	Action        string `json:"action"`
+	MsgID         string `json:"msg_id"`
+	Account       string `json:"account"`
+	EmailID       string `json:"email_id"`
+	Number        int    `json:"number"`
+	LabelID       string `json:"label_id,omitempty"`
+	LabelName     string `json:"label_name,omitempty"`
+	SenderDomain  string `json:"sender_domain,omitempty"`
+	WebhookSecret string `json:"webhook_secret,omitempty"`
 }
 
 type buttonResponse struct {
@@ -55,9 +58,15 @@ type buttonUpdate struct {
 }
 
 func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var p buttonPayload
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	if !h.validSecret(p.Context.WebhookSecret) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -70,13 +79,13 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 
 	switch ctx.Action {
 	case "archive":
-		if err := client.Archive(ctx.GmailID); err != nil {
+		if err := client.Archive(ctx.MsgID); err != nil {
 			log.Printf("archive %s: %v", ctx.EmailID, err)
 			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
 			return
 		}
 		log.Printf("archived %s", ctx.EmailID)
-		props, _ := markedDoneProps(h.MMClient, p.PostID, ctx.EmailID, "Archived")
+		props, _ := markedDoneProps(h.MMClient, p.PostID, ctx.Number, "Archived")
 		resp := buttonResponse{EphemeralText: "Archived ✓"}
 		if props != nil {
 			resp.Update = &buttonUpdate{Props: props}
@@ -84,13 +93,13 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		respondButton(w, resp)
 
 	case "mark_read":
-		if err := client.MarkRead(ctx.GmailID); err != nil {
+		if err := client.MarkRead(ctx.MsgID); err != nil {
 			log.Printf("mark_read %s: %v", ctx.EmailID, err)
 			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
 			return
 		}
 		log.Printf("marked read %s", ctx.EmailID)
-		props, _ := markedDoneProps(h.MMClient, p.PostID, ctx.EmailID, "Marked Read")
+		props, _ := markedDoneProps(h.MMClient, p.PostID, ctx.Number, "Marked Read")
 		resp := buttonResponse{EphemeralText: "Marked Read ✓"}
 		if props != nil {
 			resp.Update = &buttonUpdate{Props: props}
@@ -99,7 +108,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 
 	case "move_direct":
 		// Suggested label — one-click move with no dialog.
-		if err := client.MoveToLabel(ctx.GmailID, ctx.LabelID); err != nil {
+		if err := client.MoveToLabel(ctx.MsgID, ctx.LabelID); err != nil {
 			log.Printf("move_direct %s: %v", ctx.EmailID, err)
 			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
 			return
@@ -109,7 +118,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		if h.DB != nil && ctx.SenderDomain != "" {
 			h.DB.SetSenderSuggestion(ctx.SenderDomain, ctx.LabelID, ctx.LabelName, "user") //nolint:errcheck
 		}
-		props, _ := markedDoneProps(h.MMClient, p.PostID, ctx.EmailID, "Moved to "+ctx.LabelName)
+		props, _ := markedDoneProps(h.MMClient, p.PostID, ctx.Number, "Moved to "+ctx.LabelName)
 		resp := buttonResponse{EphemeralText: "Moved to " + ctx.LabelName + " ✓"}
 		if props != nil {
 			resp.Update = &buttonUpdate{Props: props}
@@ -133,12 +142,13 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		}
 
 		stateJSON, _ := json.Marshal(moveState{
-			PostID:       p.PostID,
-			GmailID:      ctx.GmailID,
-			Account:      ctx.Account,
-			EmailID:      ctx.EmailID,
-			Number:       ctx.Number,
-			SenderDomain: ctx.SenderDomain,
+			PostID:        p.PostID,
+			MsgID:         ctx.MsgID,
+			Account:       ctx.Account,
+			EmailID:       ctx.EmailID,
+			Number:        ctx.Number,
+			SenderDomain:  ctx.SenderDomain,
+			WebhookSecret: h.WebhookSecret,
 		})
 
 		if err := h.MMClient.OpenDialog(
@@ -169,12 +179,13 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 // --- move dialog submission ---
 
 type moveState struct {
-	PostID       string `json:"post_id"`
-	GmailID      string `json:"gmail_id"`
-	Account      string `json:"account"`
-	EmailID      string `json:"email_id"`
-	Number       int    `json:"number"`
-	SenderDomain string `json:"sender_domain,omitempty"`
+	PostID        string `json:"post_id"`
+	MsgID         string `json:"msg_id"`
+	Account       string `json:"account"`
+	EmailID       string `json:"email_id"`
+	Number        int    `json:"number"`
+	SenderDomain  string `json:"sender_domain,omitempty"`
+	WebhookSecret string `json:"webhook_secret,omitempty"`
 }
 
 type dialogSubmission struct {
@@ -185,20 +196,26 @@ type dialogSubmission struct {
 }
 
 func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var sub dialogSubmission
 	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	if sub.Cancelled {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
 	var state moveState
 	if err := json.Unmarshal([]byte(sub.State), &state); err != nil {
 		respondDialogError(w, "invalid request state")
+		return
+	}
+
+	if !h.validSecret(state.WebhookSecret) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if sub.Cancelled {
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
@@ -225,7 +242,7 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := client.MoveToLabel(state.GmailID, labelID); err != nil {
+	if err := client.MoveToLabel(state.MsgID, labelID); err != nil {
 		log.Printf("move %s to %s: %v", state.EmailID, labelID, err)
 		respondDialogError(w, "Error moving email: "+err.Error())
 		return
@@ -240,7 +257,7 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 
 	// Update the original digest post to remove buttons and show the action taken.
 	if state.PostID != "" {
-		if err := updatePostDone(h.MMClient, state.PostID, state.EmailID, "Moved to "+labelName); err != nil {
+		if err := updatePostDone(h.MMClient, state.PostID, state.Number, "Moved to "+labelName); err != nil {
 			log.Printf("update post %s: %v", state.PostID, err)
 		}
 	}
@@ -254,7 +271,7 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 
 // markedDoneProps fetches the post, clears buttons on the matching attachment,
 // and returns updated props suitable for inclusion in a button response "update".
-func markedDoneProps(mm *notify.Mattermost, postID, emailID, label string) (map[string]any, error) {
+func markedDoneProps(mm *notify.Mattermost, postID string, number int, label string) (map[string]any, error) {
 	post, err := mm.GetPost(postID)
 	if err != nil {
 		return nil, err
@@ -268,7 +285,7 @@ func markedDoneProps(mm *notify.Mattermost, postID, emailID, label string) (map[
 		if !ok {
 			continue
 		}
-		if attachmentOwnsEmail(att, emailID) {
+		if attachmentOwnsNumber(att, number) {
 			text, _ := att["text"].(string)
 			if text != "" {
 				att["text"] = text + "\n\n**" + label + " ✓**"
@@ -286,7 +303,7 @@ func markedDoneProps(mm *notify.Mattermost, postID, emailID, label string) (map[
 
 // updatePostDone patches the post directly (used after dialog submissions, which
 // cannot return an "update" in their response).
-func updatePostDone(mm *notify.Mattermost, postID, emailID, label string) error {
+func updatePostDone(mm *notify.Mattermost, postID string, number int, label string) error {
 	post, err := mm.GetPost(postID)
 	if err != nil {
 		return fmt.Errorf("get post: %w", err)
@@ -301,7 +318,7 @@ func updatePostDone(mm *notify.Mattermost, postID, emailID, label string) error 
 		if !ok {
 			continue
 		}
-		if attachmentOwnsEmail(att, emailID) {
+		if attachmentOwnsNumber(att, number) {
 			text, _ := att["text"].(string)
 			if text != "" {
 				att["text"] = text + "\n\n**" + label + " ✓**"
@@ -317,19 +334,30 @@ func updatePostDone(mm *notify.Mattermost, postID, emailID, label string) error 
 	return mm.PatchPost(postID, msg, rawAtts)
 }
 
-// attachmentOwnsEmail checks whether the attachment contains actions for the given emailID.
-// Action IDs are set as "archive__gmail-abc" so we can identify ownership via suffix.
-func attachmentOwnsEmail(att map[string]any, emailID string) bool {
-	hexID := strings.TrimPrefix(emailID, "gmail-")
+// attachmentOwnsNumber checks whether the attachment contains actions for the given digest number.
+// Action IDs are formatted as "{2-char-prefix}{number}" (e.g. "ar1", "rd2"). We match by checking
+// that the ID after the 2-char prefix equals the number exactly, avoiding false matches on
+// multi-digit numbers (e.g. "ar1" must not match number 11).
+func attachmentOwnsNumber(att map[string]any, number int) bool {
+	numStr := strconv.Itoa(number)
 	actions, _ := att["actions"].([]any)
 	for _, rawAction := range actions {
 		action, _ := rawAction.(map[string]any)
 		id, _ := action["id"].(string)
-		if strings.HasSuffix(id, hexID) {
+		if len(id) > 2 && id[2:] == numStr {
 			return true
 		}
 	}
 	return false
+}
+
+// validSecret returns true if no secret is configured, or if the provided value
+// matches using a constant-time comparison to prevent timing attacks.
+func (h *Handler) validSecret(provided string) bool {
+	if h.WebhookSecret == "" {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(h.WebhookSecret)) == 1
 }
 
 func respondButton(w http.ResponseWriter, resp buttonResponse) {

@@ -7,9 +7,9 @@ type Label struct {
 }
 
 type Actioner interface {
-	Archive(gmailMsgID string) error
-	MarkRead(gmailMsgID string) error
-	MoveToLabel(gmailMsgID, labelID string) error
+	Archive(msgID string) error
+	MarkRead(msgID string) error
+	MoveToLabel(msgID, labelID string) error
 	ListLabels() ([]Label, error)
 }
 
