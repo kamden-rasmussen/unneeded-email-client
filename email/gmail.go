@@ -64,14 +64,20 @@ func NewGmailClient(acc config.Account) (*GmailClient, error) {
 
 func (g *GmailClient) Name() string { return g.cfg.Name }
 
+const maxFetchPerAccount = 50
+
 func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {
 	q := "in:inbox"
 
 	var emails []Email
 	pageToken := ""
 
-	for {
-		req := g.svc.Users.Messages.List("me").Q(q).MaxResults(50)
+	for len(emails) < maxFetchPerAccount {
+		remaining := maxFetchPerAccount - len(emails)
+		if remaining > 50 {
+			remaining = 50
+		}
+		req := g.svc.Users.Messages.List("me").Q(q).MaxResults(int64(remaining))
 		if pageToken != "" {
 			req = req.PageToken(pageToken)
 		}
@@ -124,6 +130,85 @@ func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {
 }
 
 func (g *GmailClient) Close() error { return nil }
+
+func (g *GmailClient) InboxCount() (int, error) {
+	label, err := g.svc.Users.Labels.Get("me", "INBOX").Do()
+	if err != nil {
+		return 0, err
+	}
+	return int(label.MessagesTotal), nil
+}
+
+// FetchFrom returns up to limit inbox emails starting at the given inbox offset (0-based, newest first).
+func (g *GmailClient) FetchFrom(offset, limit int) ([]Email, error) {
+	q := "in:inbox"
+	want := offset + limit
+
+	// Collect enough message IDs by paginating through the listing.
+	var msgIDs []string
+	pageToken := ""
+	for len(msgIDs) < want {
+		need := want - len(msgIDs)
+		if need > 500 {
+			need = 500
+		}
+		req := g.svc.Users.Messages.List("me").Q(q).MaxResults(int64(need))
+		if pageToken != "" {
+			req = req.PageToken(pageToken)
+		}
+		r, err := req.Do()
+		if err != nil {
+			return nil, fmt.Errorf("listing messages: %w", err)
+		}
+		for _, m := range r.Messages {
+			msgIDs = append(msgIDs, m.Id)
+		}
+		if r.NextPageToken == "" {
+			break
+		}
+		pageToken = r.NextPageToken
+	}
+
+	if len(msgIDs) <= offset {
+		return nil, nil
+	}
+	msgIDs = msgIDs[offset:]
+	if len(msgIDs) > limit {
+		msgIDs = msgIDs[:limit]
+	}
+
+	var emails []Email
+	for _, id := range msgIDs {
+		msg, err := g.svc.Users.Messages.Get("me", id).
+			Format("metadata").
+			MetadataHeaders("From", "Subject", "Date").
+			Do()
+		if err != nil {
+			continue
+		}
+		e := Email{
+			ID:      "gmail-" + id,
+			MsgID:   id,
+			Account: g.cfg.Name,
+			Preview: msg.Snippet,
+		}
+		for _, h := range msg.Payload.Headers {
+			switch strings.ToLower(h.Name) {
+			case "from":
+				e.From, e.FromAddr = parseFrom(h.Value)
+			case "subject":
+				e.Subject = h.Value
+			case "date":
+				e.Date, _ = parseEmailDate(h.Value)
+			}
+		}
+		if e.Date.IsZero() {
+			e.Date = time.UnixMilli(msg.InternalDate)
+		}
+		emails = append(emails, e)
+	}
+	return emails, nil
+}
 
 func (g *GmailClient) MoveToLabel(msgID, labelID string) error {
 	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
@@ -213,6 +298,14 @@ func (g *GmailClient) InferLabel(senderDomain string) (*Label, error) {
 func (g *GmailClient) Archive(msgID string) error {
 	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
 		RemoveLabelIds: []string{"INBOX"},
+	}).Do()
+	return err
+}
+
+func (g *GmailClient) Delete(msgID string) error {
+	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
+		AddLabelIds:    []string{"TRASH"},
+		RemoveLabelIds: []string{"INBOX", "UNREAD"},
 	}).Do()
 	return err
 }

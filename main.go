@@ -56,6 +56,8 @@ func main() {
 	notifier := notify.NewMattermost(cfg.Mattermost)
 	processor := ai.New(cfg.Ollama, prefs)
 	actionClients := buildActionClients(cfg.Accounts)
+	suggesters := buildSuggesters(actionClients)
+	counters := buildCounters(actionClients)
 
 	// Start the HTTP action server for Mattermost button callbacks.
 	var ah *actions.Handler
@@ -66,6 +68,47 @@ func main() {
 			CallbackURL:   cfg.Mattermost.CallbackURL,
 			DB:            db,
 			WebhookSecret: cfg.Mattermost.WebhookSecret,
+			ConfigPath:    *configPath,
+			AddAccount: func(acc config.Account, client email.Actioner) error {
+				if err := config.AppendAccount(*configPath, acc); err != nil {
+					return err
+				}
+				cfg.Accounts = append(cfg.Accounts, acc)
+				if s, ok := client.(email.Suggester); ok {
+					suggesters[acc.Name] = s
+				}
+				if c, ok := client.(email.Counter); ok {
+					counters[acc.Name] = c
+				}
+				return nil
+			},
+			RenameAccount: func(oldName, newName string) error {
+				// Rename token file on disk if it used the default naming convention.
+				oldToken := oldName + "_token.json"
+				newToken := newName + "_token.json"
+				if _, err := os.Stat(oldToken); err == nil {
+					os.Rename(oldToken, newToken) //nolint:errcheck
+				}
+				// Update live cfg.Accounts slice.
+				for i := range cfg.Accounts {
+					if cfg.Accounts[i].Name == oldName {
+						cfg.Accounts[i].Name = newName
+						if cfg.Accounts[i].TokenFile == oldToken {
+							cfg.Accounts[i].TokenFile = newToken
+						}
+						break
+					}
+				}
+				// Update suggesters map.
+				if s, ok := suggesters[oldName]; ok {
+					suggesters[newName] = s
+					delete(suggesters, oldName)
+				}
+				return config.RenameAccount(*configPath, oldName, newName)
+			},
+			NextChunk: func(account string, offset int) error {
+				return loadNextChunk(account, offset, cfg, db, processor, notifier, actionClients, suggesters)
+			},
 		}
 		mux := http.NewServeMux()
 		ah.Register(mux)
@@ -81,8 +124,6 @@ func main() {
 			}
 		}()
 	}
-
-	suggesters := buildSuggesters(actionClients)
 
 	// reauthFn is called when a Gmail token is expired — posts a re-auth link via DM.
 	reauthFn := func(acc config.Account) {
@@ -109,11 +150,11 @@ func main() {
 	}
 
 	run := func() error {
-		return digest(cfg, db, processor, notifier, suggesters, reauthFn)
+		return digest(cfg, db, processor, notifier, suggesters, counters, reauthFn)
 	}
 
 	// Start poll loop — watches DM channel for text commands like "archive 1 2"
-	go pollLoop(cfg, db, actionClients, notifier, run)
+	go pollLoop(cfg, db, actionClients, notifier, ah, run)
 
 	if *runNow {
 		if err := run(); err != nil {
@@ -146,13 +187,17 @@ func main() {
 	log.Println("shutting down")
 }
 
-func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *notify.Mattermost, suggesters map[string]email.Suggester, reauthFn func(config.Account)) error {
+func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *notify.Mattermost, suggesters map[string]email.Suggester, counters map[string]email.Counter, reauthFn func(config.Account)) error {
+	t0 := time.Now()
 	log.Println("running digest...")
-	now := time.Now()
+	now := t0
 
 	var newEmails []email.Email
+	totalCounts := make(map[string]int)
+	nextOffsets := make(map[string]int)
 
 	for _, acc := range cfg.Accounts {
+		tFetch := time.Now()
 		emails, err := fetchAccount(acc, db)
 		if err != nil {
 			log.Printf("[%s] fetch error: %v", acc.Name, err)
@@ -161,33 +206,43 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 			}
 			continue
 		}
+		log.Printf("[%s] fetch: %d emails in %s", acc.Name, len(emails), time.Since(tFetch).Round(time.Millisecond))
 
+		// Get total inbox count for "X of Y" display.
+		if c, ok := counters[acc.Name]; ok {
+			if n, err := c.InboxCount(); err == nil {
+				totalCounts[acc.Name] = n
+			} else {
+				log.Printf("[%s] inbox count: %v", acc.Name, err)
+			}
+		}
+		if totalCounts[acc.Name] == 0 {
+			totalCounts[acc.Name] = len(emails)
+		}
+
+		tAI := time.Now()
+		accountShown := 0
 		for i := range emails {
+			if accountShown >= maxPerAccountConst {
+				break
+			}
 			e := &emails[i]
 
 			if proc.IsMuted(e) {
 				continue
 			}
 
-			// seen, err := db.IsSeen(e.ID)
-			// if err != nil {
-			// 	log.Printf("[%s] db lookup error: %v", acc.Name, err)
-			// 	continue
-			// }
-			// if seen {
-			// 	continue
-			// }
-
 			e.VIP = proc.IsVIP(e)
 			e.Category = proc.Categorize(e)
 			e.Preview = proc.Summarize(e)
 
-			// if err := db.MarkSeen(e.ID, acc.Name); err != nil {
-			// 	log.Printf("[%s] mark seen: %v", acc.Name, err)
-			// }
-
 			newEmails = append(newEmails, *e)
+			accountShown++
 		}
+		if accountShown >= maxPerAccountConst {
+			nextOffsets[acc.Name] = maxPerAccountConst
+		}
+		log.Printf("[%s] AI enrichment: %s", acc.Name, time.Since(tAI).Round(time.Millisecond))
 
 		if err := db.SetLastRun(acc.Name, now); err != nil {
 			log.Printf("[%s] set last run: %v", acc.Name, err)
@@ -195,6 +250,7 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 	}
 
 	// Enrich each email with a suggested destination label.
+	tSuggest := time.Now()
 	for i := range newEmails {
 		e := &newEmails[i]
 		domain := email.SenderDomain(e.FromAddr)
@@ -214,6 +270,7 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 			}
 		}
 	}
+	log.Printf("label suggestions: %s", time.Since(tSuggest).Round(time.Millisecond))
 
 	// Assign numbers and save mappings for the poll loop
 	de := make([]storage.DigestEmail, len(newEmails))
@@ -232,10 +289,21 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 		log.Printf("saving digest emails: %v", err)
 	}
 
-	log.Printf("sending digest: %d new email(s)", len(newEmails))
-	if err := notifier.SendDigest(newEmails); err != nil {
+	tSend := time.Now()
+	for acc, total := range totalCounts {
+		shown := 0
+		for _, e := range newEmails {
+			if e.Account == acc {
+				shown++
+			}
+		}
+		log.Printf("[%s] digest: showing %d of %d", acc, shown, total)
+	}
+	if err := notifier.SendDigest(newEmails, totalCounts, nextOffsets); err != nil {
 		return err
 	}
+	log.Printf("mattermost send: %s", time.Since(tSend).Round(time.Millisecond))
+	log.Printf("digest total: %s", time.Since(t0).Round(time.Millisecond))
 
 	// Advance the poll cursor so we only process replies after this digest
 	return db.SetPollCursor(time.Now().UnixMilli())
@@ -274,6 +342,117 @@ func buildSuggesters(clients map[string]email.Actioner) map[string]email.Suggest
 	return out
 }
 
+func buildCounters(clients map[string]email.Actioner) map[string]email.Counter {
+	out := make(map[string]email.Counter)
+	for name, c := range clients {
+		if cnt, ok := c.(email.Counter); ok {
+			out[name] = cnt
+		}
+	}
+	return out
+}
+
+const (
+	maxPerAccountConst      = 25
+	maxFetchPerAccountConst = 50
+)
+
+func loadNextChunk(
+	account string,
+	offset int,
+	cfg *config.Config,
+	db *storage.DB,
+	proc *ai.Processor,
+	notifier *notify.Mattermost,
+	actionClients map[string]email.Actioner,
+	suggesters map[string]email.Suggester,
+) error {
+	client, ok := actionClients[account]
+	if !ok {
+		return fmt.Errorf("no client for account %q", account)
+	}
+	paginator, ok := client.(email.Paginator)
+	if !ok {
+		return fmt.Errorf("account %q does not support pagination", account)
+	}
+
+	// Fetch up to 50 starting at offset; show up to 25 after muting.
+	fetched, err := paginator.FetchFrom(offset, maxFetchPerAccountConst)
+	if err != nil {
+		return fmt.Errorf("fetching chunk for %s: %w", account, err)
+	}
+	if len(fetched) == 0 {
+		return notifier.PostMessage(fmt.Sprintf("No more emails to load for **%s**.", account))
+	}
+
+	var chunk []email.Email
+	for i := range fetched {
+		if len(chunk) >= maxPerAccountConst {
+			break
+		}
+		e := &fetched[i]
+		if proc.IsMuted(e) {
+			continue
+		}
+		e.VIP = proc.IsVIP(e)
+		e.Category = proc.Categorize(e)
+		e.Preview = proc.Summarize(e)
+		chunk = append(chunk, *e)
+	}
+
+	if len(chunk) == 0 {
+		return notifier.PostMessage(fmt.Sprintf("No more emails to load for **%s**.", account))
+	}
+
+	// Assign numbers continuing from the existing digest.
+	maxNum, err := db.MaxDigestNumber()
+	if err != nil {
+		return err
+	}
+	de := make([]storage.DigestEmail, len(chunk))
+	for i := range chunk {
+		chunk[i].Number = maxNum + i + 1
+		de[i] = storage.DigestEmail{
+			Number:  chunk[i].Number,
+			EmailID: chunk[i].ID,
+			Account: chunk[i].Account,
+			MsgID:   chunk[i].MsgID,
+			Subject: chunk[i].Subject,
+			From:    chunk[i].From,
+		}
+	}
+	if err := db.AppendDigestEmails(de); err != nil {
+		log.Printf("append digest emails: %v", err)
+	}
+
+	// Enrich with label suggestions.
+	for i := range chunk {
+		e := &chunk[i]
+		domain := email.SenderDomain(e.FromAddr)
+		if domain == "" {
+			continue
+		}
+		if sug, err := db.GetSenderSuggestion(domain); err == nil && sug != nil {
+			e.Suggestion = &email.Label{ID: sug.LabelID, Name: sug.LabelName}
+			continue
+		}
+		if s, ok := suggesters[e.Account]; ok {
+			if label, err := s.InferLabel(domain); err == nil && label != nil {
+				e.Suggestion = label
+				db.SetSenderSuggestion(domain, label.ID, label.Name, "inferred") //nolint:errcheck
+			}
+		}
+	}
+
+	// Show another "load next" button if we hit the per-account cap.
+	var nextOffsets map[string]int
+	if len(chunk) >= maxPerAccountConst {
+		nextOffsets = map[string]int{account: offset + maxPerAccountConst}
+	}
+
+	return notifier.SendDigest(chunk, nil, nextOffsets)
+}
+
 func buildActionClients(accounts []config.Account) map[string]email.Actioner {
 	clients := make(map[string]email.Actioner)
 	for _, acc := range accounts {
@@ -299,19 +478,19 @@ func buildActionClients(accounts []config.Account) map[string]email.Actioner {
 }
 
 // pollLoop checks the DM channel on an interval for commands from the user.
-func pollLoop(cfg *config.Config, db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost, digestFn func() error) {
+func pollLoop(cfg *config.Config, db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost, ah *actions.Handler, digestFn func() error) {
 	interval := time.Duration(cfg.PollInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if err := processPoll(db, clients, mm, digestFn); err != nil {
+		if err := processPoll(db, clients, mm, ah, digestFn); err != nil {
 			log.Printf("poll: %v", err)
 		}
 	}
 }
 
-func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost, digestFn func() error) error {
+func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost, ah *actions.Handler, digestFn func() error) error {
 	cursor, err := db.GetPollCursor()
 	if err != nil {
 		return err
@@ -329,7 +508,7 @@ func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.M
 	now := time.Now().UnixMilli()
 
 	for _, msg := range messages {
-		reply, err := executeCommand(strings.TrimSpace(msg.Message), db, clients, digestFn)
+		reply, err := executeCommand(strings.TrimSpace(msg.Message), db, clients, ah, digestFn)
 		if err != nil {
 			log.Printf("command %q: %v", msg.Message, err)
 			mm.PostMessage("Error: " + err.Error()) //nolint:errcheck
@@ -343,8 +522,8 @@ func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.M
 	return db.SetPollCursor(now)
 }
 
-// executeCommand parses and runs a command like "archive 1 3", "read 2", "done all", or "check".
-func executeCommand(text string, db *storage.DB, clients map[string]email.Actioner, digestFn func() error) (string, error) {
+// executeCommand parses and runs a command like "archive 1 3", "read 2", "done all", "check", or "add gmail work".
+func executeCommand(text string, db *storage.DB, clients map[string]email.Actioner, ah *actions.Handler, digestFn func() error) (string, error) {
 	fields := strings.Fields(strings.ToLower(text))
 	if len(fields) == 0 {
 		return "", nil
@@ -354,6 +533,28 @@ func executeCommand(text string, db *storage.DB, clients map[string]email.Action
 
 	if action == "check" || action == "digest" {
 		return "", digestFn()
+	}
+
+	if action == "add" {
+		if len(fields) < 3 {
+			return "Usage: `add gmail <name>` · `add imap <name>` · `add icloud <name>`", nil
+		}
+		if ah == nil {
+			return "Account setup requires `callback_url` to be configured.", nil
+		}
+		ah.HandleAddCommand(fields[1], fields[2])
+		return "", nil
+	}
+
+	if action == "rename" {
+		if len(fields) < 3 {
+			return "Usage: `rename <old-name> <new-name>`", nil
+		}
+		if ah == nil {
+			return "Rename requires `callback_url` to be configured.", nil
+		}
+		ah.HandleRenameCommand(fields[1], fields[2])
+		return "", nil
 	}
 
 	if len(fields) < 2 {

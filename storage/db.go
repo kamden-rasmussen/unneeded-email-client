@@ -138,6 +138,31 @@ func (d *DB) GetDigestEmail(number int) (DigestEmail, error) {
 	return e, err
 }
 
+// MaxDigestNumber returns the highest number currently in the digest, or 0 if empty.
+func (d *DB) MaxDigestNumber() (int, error) {
+	var n int
+	err := d.db.QueryRow("SELECT COALESCE(MAX(number), 0) FROM digest_emails").Scan(&n)
+	return n, err
+}
+
+// AppendDigestEmails inserts new digest email records without clearing existing ones.
+func (d *DB) AppendDigestEmails(emails []DigestEmail) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, e := range emails {
+		if _, err := tx.Exec(
+			"INSERT OR IGNORE INTO digest_emails (number, email_id, account, msg_id, subject, from_name) VALUES (?, ?, ?, ?, ?, ?)",
+			e.Number, e.EmailID, e.Account, e.MsgID, e.Subject, e.From,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (d *DB) GetAllDigestEmails() ([]DigestEmail, error) {
 	rows, err := d.db.Query(
 		"SELECT number, email_id, account, msg_id, subject, from_name FROM digest_emails ORDER BY number",

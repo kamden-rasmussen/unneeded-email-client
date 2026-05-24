@@ -8,6 +8,7 @@ type Label struct {
 
 type Actioner interface {
 	Archive(msgID string) error
+	Delete(msgID string) error
 	MarkRead(msgID string) error
 	MoveToLabel(msgID, labelID string) error
 	ListLabels() ([]Label, error)
@@ -17,4 +18,16 @@ type Actioner interface {
 // existing organized mail. GmailClient implements this; IMAP does not.
 type Suggester interface {
 	InferLabel(senderDomain string) (*Label, error)
+}
+
+// Counter can report the total number of messages in the inbox.
+// GmailClient implements this; IMAP does not.
+type Counter interface {
+	InboxCount() (int, error)
+}
+
+// Paginator supports fetching a page of emails by inbox offset.
+// GmailClient implements this; IMAP does not.
+type Paginator interface {
+	FetchFrom(offset, limit int) ([]Email, error)
 }
