@@ -7,6 +7,7 @@ import (
 
 type Email struct {
 	ID         string
+	MsgID      string // account-native message ID (Gmail hex ID or IMAP UID string)
 	Account    string
 	From       string
 	FromAddr   string
