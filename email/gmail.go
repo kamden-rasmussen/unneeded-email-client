@@ -64,14 +64,20 @@ func NewGmailClient(acc config.Account) (*GmailClient, error) {
 
 func (g *GmailClient) Name() string { return g.cfg.Name }
 
+const maxFetchPerAccount = 50
+
 func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {
 	q := "in:inbox"
 
 	var emails []Email
 	pageToken := ""
 
-	for {
-		req := g.svc.Users.Messages.List("me").Q(q).MaxResults(50)
+	for len(emails) < maxFetchPerAccount {
+		remaining := maxFetchPerAccount - len(emails)
+		if remaining > 50 {
+			remaining = 50
+		}
+		req := g.svc.Users.Messages.List("me").Q(q).MaxResults(int64(remaining))
 		if pageToken != "" {
 			req = req.PageToken(pageToken)
 		}
@@ -124,6 +130,14 @@ func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {
 }
 
 func (g *GmailClient) Close() error { return nil }
+
+func (g *GmailClient) InboxCount() (int, error) {
+	label, err := g.svc.Users.Labels.Get("me", "INBOX").Do()
+	if err != nil {
+		return 0, err
+	}
+	return int(label.MessagesTotal), nil
+}
 
 func (g *GmailClient) MoveToLabel(msgID, labelID string) error {
 	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{

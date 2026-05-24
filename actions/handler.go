@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kamden/emailagent/config"
 	"github.com/kamden/emailagent/email"
 	"github.com/kamden/emailagent/notify"
 	"github.com/kamden/emailagent/storage"
@@ -24,6 +25,12 @@ type Handler struct {
 	CallbackURL   string
 	DB            *storage.DB // for recording user-confirmed sender→label mappings
 	WebhookSecret string
+	ConfigPath    string
+	// AddAccount is called when a new account is fully set up; it should persist
+	// the account to config and update any live state in main (e.g. suggesters).
+	AddAccount    func(acc config.Account, client email.Actioner) error
+	// RenameAccount is called to persist a rename and update live state in main.
+	RenameAccount func(oldName, newName string) error
 	pendingOAuths sync.Map // state string → *pendingOAuth
 }
 
@@ -32,6 +39,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/actions/email", h.handleEmailAction)
 	mux.HandleFunc("/actions/move_dialog", h.handleMoveDialog)
 	mux.HandleFunc("/setup/gmail/callback", h.handleGmailCallback)
+	mux.HandleFunc("/setup/imap/start", h.handleIMAPStart)
+	mux.HandleFunc("/setup/imap/callback", h.handleIMAPCallback)
 }
 
 // StartGmailReauth generates an OAuth2 authorization URL for re-authorizing a Gmail account.

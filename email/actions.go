@@ -18,3 +18,9 @@ type Actioner interface {
 type Suggester interface {
 	InferLabel(senderDomain string) (*Label, error)
 }
+
+// Counter can report the total number of messages in the inbox.
+// GmailClient implements this; IMAP does not.
+type Counter interface {
+	InboxCount() (int, error)
+}

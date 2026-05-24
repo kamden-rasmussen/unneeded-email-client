@@ -63,6 +63,9 @@ type DialogElement struct {
 	DisplayName string         `json:"display_name"`
 	Name        string         `json:"name"`
 	Type        string         `json:"type"`
+	Default     string         `json:"default,omitempty"`
+	Placeholder string         `json:"placeholder,omitempty"`
+	Optional    bool           `json:"optional,omitempty"`
 	Options     []SelectOption `json:"options,omitempty"`
 }
 
@@ -81,7 +84,8 @@ func NewMattermost(cfg config.Mattermost) *Mattermost {
 
 // SendDigest posts the digest. Uses per-email attachment cards with buttons when
 // CallbackURL is configured; otherwise falls back to a plain text message.
-func (m *Mattermost) SendDigest(emails []email.Email) error {
+// totalCounts maps account name → total inbox message count for "X of Y" display.
+func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int) error {
 	header := fmt.Sprintf("### Email Digest — %s", time.Now().Format("Monday, January 2"))
 
 	if len(emails) == 0 {
@@ -94,9 +98,43 @@ func (m *Mattermost) SendDigest(emails []email.Email) error {
 
 	header += fmt.Sprintf("\n\n**%d new email(s)**  _Reply with `archive 1 2`, `read 3`, `done all` if buttons aren't working_", len(emails))
 
-	atts := make([]Attachment, len(emails))
-	for i, e := range emails {
-		atts[i] = buildEmailAttachment(e, m.cfg.CallbackURL, m.cfg.WebhookSecret)
+	// Count distinct accounts and how many emails we're showing per account.
+	shownPerAccount := make(map[string]int)
+	for _, e := range emails {
+		shownPerAccount[e.Account]++
+	}
+	multiAccount := len(shownPerAccount) > 1
+
+	// Show account headers if multi-account, or if any account is capped (showing fewer than total).
+	showHeaders := multiAccount
+	if !showHeaders {
+		for acc, shown := range shownPerAccount {
+			if total := totalCounts[acc]; total > 0 && shown < total {
+				showHeaders = true
+				break
+			}
+		}
+	}
+
+	var atts []Attachment
+	var lastAccount string
+	for _, e := range emails {
+		if showHeaders && e.Account != lastAccount {
+			shown := shownPerAccount[e.Account]
+			total := totalCounts[e.Account]
+			var headerText string
+			if total > 0 && shown < total {
+				headerText = fmt.Sprintf("**%s** · %d of %d", e.Account, shown, total)
+			} else {
+				headerText = "**" + e.Account + "**"
+			}
+			atts = append(atts, Attachment{
+				Text:  headerText,
+				Color: "#4A9EE8",
+			})
+			lastAccount = e.Account
+		}
+		atts = append(atts, buildEmailAttachment(e, m.cfg.CallbackURL, m.cfg.WebhookSecret))
 	}
 
 	_, err := m.postWithAttachments(header, atts)
@@ -182,6 +220,12 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string) Atta
 	}
 
 	return att
+}
+
+// SendPromptWithButton posts a message with a single action button.
+func (m *Mattermost) SendPromptWithButton(message string, action Action) error {
+	_, err := m.postWithAttachments(message, []Attachment{{Actions: []Action{action}}})
+	return err
 }
 
 // PostMessage sends a plain text message to the DM channel.

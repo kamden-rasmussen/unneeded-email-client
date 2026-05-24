@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/kamden/emailagent/config"
 	"github.com/kamden/emailagent/email"
 )
 
@@ -15,6 +16,9 @@ type pendingOAuth struct {
 	expiresAt   time.Time
 	// refresh is called after the token is saved; its return value replaces the live client.
 	refresh func() (email.Actioner, error)
+	// newAccount is set when adding a brand-new account (not a re-auth).
+	// After the client is created, AddAccount is called to persist it.
+	newAccount *config.Account
 }
 
 func (h *Handler) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +60,11 @@ func (h *Handler) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 	if pending.refresh != nil {
 		if newClient, err := pending.refresh(); err == nil {
 			h.Clients[pending.accountName] = newClient
+			if pending.newAccount != nil && h.AddAccount != nil {
+				if err := h.AddAccount(*pending.newAccount, newClient); err != nil {
+					log.Printf("persist new account %s: %v", pending.accountName, err)
+				}
+			}
 		} else {
 			log.Printf("refresh client for %s after reauth: %v", pending.accountName, err)
 		}
