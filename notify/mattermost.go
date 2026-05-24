@@ -8,17 +8,24 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kamden/emailagent/config"
 	"github.com/kamden/emailagent/email"
 )
 
+type digestCacheEntry struct {
+	message string
+	atts    []Attachment
+}
+
 type Mattermost struct {
-	cfg       config.Mattermost
-	http      *http.Client
-	channelID string
-	botID     string
+	cfg         config.Mattermost
+	http        *http.Client
+	channelID   string
+	botID       string
+	digestCache sync.Map // postID → digestCacheEntry
 }
 
 type Post struct {
@@ -237,7 +244,7 @@ func (m *Mattermost) GetPost(postID string) (map[string]any, error) {
 }
 
 // PatchPost updates a post's message and attachment props in-place.
-func (m *Mattermost) PatchPost(postID, message string, attachments []any) error {
+func (m *Mattermost) PatchPost(postID, message string, attachments []Attachment) error {
 	body := map[string]any{
 		"message": message,
 		"props": map[string]any{
@@ -281,6 +288,30 @@ func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state s
 	return nil
 }
 
+// GetDigestPost returns the cached message and attachments for a digest post.
+// Attachments are returned as a copy so callers can modify without affecting the cache.
+func (m *Mattermost) GetDigestPost(postID string) (message string, atts []Attachment, ok bool) {
+	val, loaded := m.digestCache.Load(postID)
+	if !loaded {
+		return "", nil, false
+	}
+	e := val.(digestCacheEntry)
+	cp := make([]Attachment, len(e.atts))
+	copy(cp, e.atts)
+	return e.message, cp, true
+}
+
+// UpdateDigestPost writes modified attachments back into the digest cache.
+func (m *Mattermost) UpdateDigestPost(postID string, atts []Attachment) {
+	val, ok := m.digestCache.Load(postID)
+	if !ok {
+		return
+	}
+	e := val.(digestCacheEntry)
+	e.atts = atts
+	m.digestCache.Store(postID, e)
+}
+
 func (m *Mattermost) postWithAttachments(message string, atts []Attachment) (string, error) {
 	if err := m.resolveChannelID(); err != nil {
 		return "", err
@@ -305,6 +336,9 @@ func (m *Mattermost) postWithAttachments(message string, atts []Attachment) (str
 		ID string `json:"id"`
 	}
 	json.Unmarshal(b, &post) //nolint:errcheck
+	if post.ID != "" {
+		m.digestCache.Store(post.ID, digestCacheEntry{message: message, atts: atts})
+	}
 	return post.ID, nil
 }
 

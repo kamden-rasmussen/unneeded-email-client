@@ -45,7 +45,7 @@ func (p *Processor) Summarize(e *email.Email) string {
 		return e.Preview
 	}
 	prompt := fmt.Sprintf(
-		"Summarize this email in one concise sentence (max 20 words). Respond with only the summary sentence, no preamble or explanation.\n\nFrom: %s\nSubject: %s\nContent: %s",
+		"You are an email summarizer. Write a single sentence (max 25 words) describing what this email is about and what action, if any, is needed. Reply with only the sentence — no greeting, no preamble, no explanation.\n\nFrom: %s\nSubject: %s\nBody: %s",
 		e.From, e.Subject, e.Preview,
 	)
 	summary, err := p.generate(prompt)
@@ -112,11 +112,24 @@ func (p *Processor) generate(prompt string) (string, error) {
 		return "", err
 	}
 
-	resp, err := p.client.Post(p.cfg.Host+"/api/generate", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", p.cfg.Host+"/api/generate", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
+	}
+
+	resp, err := p.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("ollama request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("ollama %d", resp.StatusCode)
+	}
 
 	var result struct {
 		Response string `json:"response"`
