@@ -1,12 +1,16 @@
 package actions
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/kamden/emailagent/email"
 	"github.com/kamden/emailagent/notify"
@@ -20,12 +24,35 @@ type Handler struct {
 	CallbackURL   string
 	DB            *storage.DB // for recording user-confirmed sender→label mappings
 	WebhookSecret string
+	pendingOAuths sync.Map // state string → *pendingOAuth
 }
 
 // Register wires up HTTP routes on mux.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/actions/email", h.handleEmailAction)
 	mux.HandleFunc("/actions/move_dialog", h.handleMoveDialog)
+	mux.HandleFunc("/setup/gmail/callback", h.handleGmailCallback)
+}
+
+// StartGmailReauth generates an OAuth2 authorization URL for re-authorizing a Gmail account.
+// The user visits the URL in their browser; on completion the callback saves the new token.
+func (h *Handler) StartGmailReauth(accountName, tokenFile string) (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	state := hex.EncodeToString(b)
+	redirectURL := h.CallbackURL + "/setup/gmail/callback"
+	authURL, err := email.GmailAuthURL(redirectURL, state)
+	if err != nil {
+		return "", err
+	}
+	h.pendingOAuths.Store(state, &pendingOAuth{
+		accountName: accountName,
+		tokenFile:   tokenFile,
+		expiresAt:   time.Now().Add(10 * time.Minute),
+	})
+	return authURL, nil
 }
 
 // --- button action ---

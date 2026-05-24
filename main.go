@@ -58,8 +58,9 @@ func main() {
 	actionClients := buildActionClients(cfg.Accounts)
 
 	// Start the HTTP action server for Mattermost button callbacks.
+	var ah *actions.Handler
 	if cfg.Mattermost.CallbackURL != "" {
-		ah := &actions.Handler{
+		ah = &actions.Handler{
 			Clients:       actionClients,
 			MMClient:      notifier,
 			CallbackURL:   cfg.Mattermost.CallbackURL,
@@ -83,8 +84,29 @@ func main() {
 
 	suggesters := buildSuggesters(actionClients)
 
+	// reauthFn is called when a Gmail token is expired — posts a re-auth link via DM.
+	reauthFn := func(acc config.Account) {
+		if ah == nil {
+			log.Printf("[%s] token expired but no callback_url configured for re-auth", acc.Name)
+			return
+		}
+		tokenFile := acc.TokenFile
+		if tokenFile == "" {
+			tokenFile = acc.Name + "_token.json"
+		}
+		url, err := ah.StartGmailReauth(acc.Name, tokenFile)
+		if err != nil {
+			log.Printf("start reauth for %s: %v", acc.Name, err)
+			return
+		}
+		notifier.PostMessage(fmt.Sprintf( //nolint:errcheck
+			"⚠️ Gmail token for **%s** has expired.\n\n[Click here to re-authorize](%s)\n\n_Link expires in 10 minutes._",
+			acc.Name, url,
+		))
+	}
+
 	run := func() error {
-		return digest(cfg, db, processor, notifier, suggesters)
+		return digest(cfg, db, processor, notifier, suggesters, reauthFn)
 	}
 
 	// Start poll loop — watches DM channel for text commands like "archive 1 2"
@@ -121,7 +143,7 @@ func main() {
 	log.Println("shutting down")
 }
 
-func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *notify.Mattermost, suggesters map[string]email.Suggester) error {
+func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *notify.Mattermost, suggesters map[string]email.Suggester, reauthFn func(config.Account)) error {
 	log.Println("running digest...")
 	now := time.Now()
 
@@ -131,6 +153,9 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 		emails, err := fetchAccount(acc, db)
 		if err != nil {
 			log.Printf("[%s] fetch error: %v", acc.Name, err)
+			if strings.Contains(err.Error(), "invalid_grant") {
+				reauthFn(acc)
+			}
 			continue
 		}
 

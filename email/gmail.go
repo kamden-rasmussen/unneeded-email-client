@@ -19,18 +19,18 @@ import (
 	"github.com/kamden/emailagent/config"
 )
 
-const (
-	gmailClientID     = "195489124467-gp35qrirjndsrgkj7rndg6pme6itj59s.apps.googleusercontent.com"
-	gmailClientSecret = "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"
-)
-
-func gmailOAuthConfig() *oauth2.Config {
+func gmailOAuthConfig() (*oauth2.Config, error) {
+	clientID := os.Getenv("GMAIL_CLIENT_ID")
+	clientSecret := os.Getenv("GMAIL_CLIENT_SECRET")
+	if clientID == "" || clientSecret == "" {
+		return nil, fmt.Errorf("GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET environment variables must be set")
+	}
 	return &oauth2.Config{
-		ClientID:     gmailClientID,
-		ClientSecret: gmailClientSecret,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
 		Scopes:       []string{gmail.GmailModifyScope},
 		Endpoint:     google.Endpoint,
-	}
+	}, nil
 }
 
 type GmailClient struct {
@@ -45,7 +45,11 @@ func NewGmailClient(acc config.Account) (*GmailClient, error) {
 		tokenFile = acc.Name + "_token.json"
 	}
 
-	httpClient, err := oauthHTTPClient(gmailOAuthConfig(), tokenFile)
+	oauthCfg, err := gmailOAuthConfig()
+	if err != nil {
+		return nil, err
+	}
+	httpClient, err := oauthHTTPClient(oauthCfg, tokenFile)
 	if err != nil {
 		return nil, fmt.Errorf("oauth for %s: %w", acc.Name, err)
 	}
@@ -310,10 +314,41 @@ func browserAuthFlow(cfg *oauth2.Config, port int) (*oauth2.Token, error) {
 	}
 }
 
+// GmailAuthURL generates an OAuth2 authorization URL for the server-side callback flow.
+// redirectURL must be registered in Google Cloud Console. state should be random (CSRF protection).
+// ApprovalForce ensures a fresh refresh token is returned even if the user previously authorized.
+func GmailAuthURL(redirectURL, state string) (string, error) {
+	cfg, err := gmailOAuthConfig()
+	if err != nil {
+		return "", err
+	}
+	cfg.RedirectURL = redirectURL
+	return cfg.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce), nil
+}
+
+// GmailExchangeCode exchanges an authorization code for a token using the server redirect URL.
+func GmailExchangeCode(redirectURL, code string) (*oauth2.Token, error) {
+	cfg, err := gmailOAuthConfig()
+	if err != nil {
+		return nil, err
+	}
+	cfg.RedirectURL = redirectURL
+	return cfg.Exchange(context.Background(), code)
+}
+
+// SaveToken writes an OAuth2 token to path with restrictive permissions.
+func SaveToken(path string, tok *oauth2.Token) error {
+	return saveToken(path, tok)
+}
+
 // RunGmailAuth runs the OAuth2 browser flow and saves the token to tokenFile.
 // port fixes the callback listener port (useful for SSH tunneling); 0 picks a random port.
 func RunGmailAuth(tokenFile string, port int) error {
-	tok, err := browserAuthFlow(gmailOAuthConfig(), port)
+	cfg, err := gmailOAuthConfig()
+	if err != nil {
+		return err
+	}
+	tok, err := browserAuthFlow(cfg, port)
 	if err != nil {
 		return err
 	}
