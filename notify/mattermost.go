@@ -247,6 +247,13 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 			Type:        "button",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("move")},
 		},
+		Action{
+			ID:          "dl" + n,
+			Name:        "Delete",
+			Type:        "button",
+			Style:       "danger",
+			Integration: &Integration{URL: actionURL, Context: mkCtx("delete")},
+		},
 	)
 
 	att := Attachment{

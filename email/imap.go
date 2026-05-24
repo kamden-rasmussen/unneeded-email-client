@@ -120,6 +120,14 @@ func (ic *IMAPClient) Archive(msgID string) error {
 	return ic.moveUID(msgID, archiveMailbox)
 }
 
+func (ic *IMAPClient) Delete(msgID string) error {
+	trashMailbox := ic.cfg.TrashMailbox
+	if trashMailbox == "" {
+		trashMailbox = "Trash"
+	}
+	return ic.moveUID(msgID, trashMailbox)
+}
+
 func (ic *IMAPClient) MarkRead(msgID string) error {
 	if err := ic.reconnect(); err != nil {
 		return err

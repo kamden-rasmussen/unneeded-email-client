@@ -8,6 +8,7 @@ type Label struct {
 
 type Actioner interface {
 	Archive(msgID string) error
+	Delete(msgID string) error
 	MarkRead(msgID string) error
 	MoveToLabel(msgID, labelID string) error
 	ListLabels() ([]Label, error)

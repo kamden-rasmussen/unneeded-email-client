@@ -24,6 +24,7 @@ type Account struct {
 	Port            int    `yaml:"port"`
 	Password        string `yaml:"password"`
 	ArchiveMailbox  string `yaml:"archive_mailbox"` // IMAP only; defaults to "Archive"
+	TrashMailbox    string `yaml:"trash_mailbox"`   // IMAP only; defaults to "Trash"
 	TokenFile string `yaml:"token_file"`
 }
 

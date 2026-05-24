@@ -169,6 +169,20 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		}
 		respondButton(w, resp)
 
+	case "delete":
+		if err := client.Delete(ctx.MsgID); err != nil {
+			log.Printf("delete %s: %v", ctx.EmailID, err)
+			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
+			return
+		}
+		log.Printf("deleted %s", ctx.EmailID)
+		props, _ := markedDoneProps(h.MMClient, p.PostID, ctx.Number, "Deleted")
+		resp := buttonResponse{EphemeralText: "Deleted ✓"}
+		if props != nil {
+			resp.Update = &buttonUpdate{Props: props}
+		}
+		respondButton(w, resp)
+
 	case "move":
 		labels, err := client.ListLabels()
 		if err != nil {

@@ -302,6 +302,14 @@ func (g *GmailClient) Archive(msgID string) error {
 	return err
 }
 
+func (g *GmailClient) Delete(msgID string) error {
+	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
+		AddLabelIds:    []string{"TRASH"},
+		RemoveLabelIds: []string{"INBOX", "UNREAD"},
+	}).Do()
+	return err
+}
+
 func (g *GmailClient) MarkRead(msgID string) error {
 	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
 		RemoveLabelIds: []string{"UNREAD"},
