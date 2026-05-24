@@ -28,9 +28,12 @@ type Handler struct {
 	ConfigPath    string
 	// AddAccount is called when a new account is fully set up; it should persist
 	// the account to config and update any live state in main (e.g. suggesters).
-	AddAccount    func(acc config.Account, client email.Actioner) error
+	AddAccount func(acc config.Account, client email.Actioner) error
 	// RenameAccount is called to persist a rename and update live state in main.
 	RenameAccount func(oldName, newName string) error
+	// NextChunk is called when a user clicks "load next chunk"; it fetches and
+	// posts the next page of emails for the given account starting at offset.
+	NextChunk     func(account string, offset int) error
 	pendingOAuths sync.Map // state string → *pendingOAuth
 }
 
@@ -79,6 +82,7 @@ type actionContext struct {
 	Account       string `json:"account"`
 	EmailID       string `json:"email_id"`
 	Number        int    `json:"number"`
+	Offset        int    `json:"offset,omitempty"`
 	LabelID       string `json:"label_id,omitempty"`
 	LabelName     string `json:"label_name,omitempty"`
 	SenderDomain  string `json:"sender_domain,omitempty"`
@@ -210,6 +214,19 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		}
 		// Empty response — Mattermost will show the dialog.
 		respondButton(w, buttonResponse{})
+
+	case "next_chunk":
+		if h.NextChunk == nil {
+			respondButton(w, buttonResponse{EphemeralText: "Load more is not configured."})
+			return
+		}
+		respondButton(w, buttonResponse{EphemeralText: "Loading next emails for " + ctx.Account + "…"})
+		go func() {
+			if err := h.NextChunk(ctx.Account, ctx.Offset); err != nil {
+				log.Printf("next_chunk %s offset %d: %v", ctx.Account, ctx.Offset, err)
+				h.MMClient.PostMessage("Error loading next chunk: " + err.Error()) //nolint:errcheck
+			}
+		}()
 
 	default:
 		respondButton(w, buttonResponse{EphemeralText: "unknown action: " + ctx.Action})

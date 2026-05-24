@@ -24,3 +24,9 @@ type Suggester interface {
 type Counter interface {
 	InboxCount() (int, error)
 }
+
+// Paginator supports fetching a page of emails by inbox offset.
+// GmailClient implements this; IMAP does not.
+type Paginator interface {
+	FetchFrom(offset, limit int) ([]Email, error)
+}

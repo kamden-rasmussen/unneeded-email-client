@@ -106,6 +106,9 @@ func main() {
 				}
 				return config.RenameAccount(*configPath, oldName, newName)
 			},
+			NextChunk: func(account string, offset int) error {
+				return loadNextChunk(account, offset, cfg, db, processor, notifier, actionClients, suggesters)
+			},
 		}
 		mux := http.NewServeMux()
 		ah.Register(mux)
@@ -189,10 +192,9 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 	log.Println("running digest...")
 	now := t0
 
-	const maxPerAccount = 25
-
 	var newEmails []email.Email
 	totalCounts := make(map[string]int)
+	nextOffsets := make(map[string]int)
 
 	for _, acc := range cfg.Accounts {
 		tFetch := time.Now()
@@ -221,7 +223,7 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 		tAI := time.Now()
 		accountShown := 0
 		for i := range emails {
-			if accountShown >= maxPerAccount {
+			if accountShown >= maxPerAccountConst {
 				break
 			}
 			e := &emails[i]
@@ -236,6 +238,9 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 
 			newEmails = append(newEmails, *e)
 			accountShown++
+		}
+		if accountShown >= maxPerAccountConst {
+			nextOffsets[acc.Name] = maxPerAccountConst
 		}
 		log.Printf("[%s] AI enrichment: %s", acc.Name, time.Since(tAI).Round(time.Millisecond))
 
@@ -285,8 +290,16 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 	}
 
 	tSend := time.Now()
-	log.Printf("sending digest: %d new email(s)", len(newEmails))
-	if err := notifier.SendDigest(newEmails, totalCounts); err != nil {
+	for acc, total := range totalCounts {
+		shown := 0
+		for _, e := range newEmails {
+			if e.Account == acc {
+				shown++
+			}
+		}
+		log.Printf("[%s] digest: showing %d of %d", acc, shown, total)
+	}
+	if err := notifier.SendDigest(newEmails, totalCounts, nextOffsets); err != nil {
 		return err
 	}
 	log.Printf("mattermost send: %s", time.Since(tSend).Round(time.Millisecond))
@@ -337,6 +350,107 @@ func buildCounters(clients map[string]email.Actioner) map[string]email.Counter {
 		}
 	}
 	return out
+}
+
+const (
+	maxPerAccountConst      = 25
+	maxFetchPerAccountConst = 50
+)
+
+func loadNextChunk(
+	account string,
+	offset int,
+	cfg *config.Config,
+	db *storage.DB,
+	proc *ai.Processor,
+	notifier *notify.Mattermost,
+	actionClients map[string]email.Actioner,
+	suggesters map[string]email.Suggester,
+) error {
+	client, ok := actionClients[account]
+	if !ok {
+		return fmt.Errorf("no client for account %q", account)
+	}
+	paginator, ok := client.(email.Paginator)
+	if !ok {
+		return fmt.Errorf("account %q does not support pagination", account)
+	}
+
+	// Fetch up to 50 starting at offset; show up to 25 after muting.
+	fetched, err := paginator.FetchFrom(offset, maxFetchPerAccountConst)
+	if err != nil {
+		return fmt.Errorf("fetching chunk for %s: %w", account, err)
+	}
+	if len(fetched) == 0 {
+		return notifier.PostMessage(fmt.Sprintf("No more emails to load for **%s**.", account))
+	}
+
+	var chunk []email.Email
+	for i := range fetched {
+		if len(chunk) >= maxPerAccountConst {
+			break
+		}
+		e := &fetched[i]
+		if proc.IsMuted(e) {
+			continue
+		}
+		e.VIP = proc.IsVIP(e)
+		e.Category = proc.Categorize(e)
+		e.Preview = proc.Summarize(e)
+		chunk = append(chunk, *e)
+	}
+
+	if len(chunk) == 0 {
+		return notifier.PostMessage(fmt.Sprintf("No more emails to load for **%s**.", account))
+	}
+
+	// Assign numbers continuing from the existing digest.
+	maxNum, err := db.MaxDigestNumber()
+	if err != nil {
+		return err
+	}
+	de := make([]storage.DigestEmail, len(chunk))
+	for i := range chunk {
+		chunk[i].Number = maxNum + i + 1
+		de[i] = storage.DigestEmail{
+			Number:  chunk[i].Number,
+			EmailID: chunk[i].ID,
+			Account: chunk[i].Account,
+			MsgID:   chunk[i].MsgID,
+			Subject: chunk[i].Subject,
+			From:    chunk[i].From,
+		}
+	}
+	if err := db.AppendDigestEmails(de); err != nil {
+		log.Printf("append digest emails: %v", err)
+	}
+
+	// Enrich with label suggestions.
+	for i := range chunk {
+		e := &chunk[i]
+		domain := email.SenderDomain(e.FromAddr)
+		if domain == "" {
+			continue
+		}
+		if sug, err := db.GetSenderSuggestion(domain); err == nil && sug != nil {
+			e.Suggestion = &email.Label{ID: sug.LabelID, Name: sug.LabelName}
+			continue
+		}
+		if s, ok := suggesters[e.Account]; ok {
+			if label, err := s.InferLabel(domain); err == nil && label != nil {
+				e.Suggestion = label
+				db.SetSenderSuggestion(domain, label.ID, label.Name, "inferred") //nolint:errcheck
+			}
+		}
+	}
+
+	// Show another "load next" button if we hit the per-account cap.
+	var nextOffsets map[string]int
+	if len(chunk) >= maxPerAccountConst {
+		nextOffsets = map[string]int{account: offset + maxPerAccountConst}
+	}
+
+	return notifier.SendDigest(chunk, nil, nextOffsets)
 }
 
 func buildActionClients(accounts []config.Account) map[string]email.Actioner {
