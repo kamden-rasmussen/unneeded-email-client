@@ -63,6 +63,9 @@ type DialogElement struct {
 	DisplayName string         `json:"display_name"`
 	Name        string         `json:"name"`
 	Type        string         `json:"type"`
+	Default     string         `json:"default,omitempty"`
+	Placeholder string         `json:"placeholder,omitempty"`
+	Optional    bool           `json:"optional,omitempty"`
 	Options     []SelectOption `json:"options,omitempty"`
 }
 
@@ -81,7 +84,9 @@ func NewMattermost(cfg config.Mattermost) *Mattermost {
 
 // SendDigest posts the digest. Uses per-email attachment cards with buttons when
 // CallbackURL is configured; otherwise falls back to a plain text message.
-func (m *Mattermost) SendDigest(emails []email.Email) error {
+// totalCounts maps account name → total inbox message count for "X of Y" header display.
+// nextOffsets maps account name → inbox offset for the "load next chunk" button; omit or nil to suppress.
+func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int, nextOffsets map[string]int) error {
 	header := fmt.Sprintf("### Email Digest — %s", time.Now().Format("Monday, January 2"))
 
 	if len(emails) == 0 {
@@ -94,16 +99,90 @@ func (m *Mattermost) SendDigest(emails []email.Email) error {
 
 	header += fmt.Sprintf("\n\n**%d new email(s)**  _Reply with `archive 1 2`, `read 3`, `done all` if buttons aren't working_", len(emails))
 
-	atts := make([]Attachment, len(emails))
+	// sessionTotal is the highest email number in this batch; used for [N/total] display.
+	sessionTotal := emails[len(emails)-1].Number
+
+	// Count distinct accounts and how many emails we're showing per account.
+	shownPerAccount := make(map[string]int)
+	for _, e := range emails {
+		shownPerAccount[e.Account]++
+	}
+	multiAccount := len(shownPerAccount) > 1
+
+	// Show account headers if multi-account, or if any account is capped (showing fewer than total inbox).
+	showHeaders := multiAccount
+	if !showHeaders {
+		for acc, shown := range shownPerAccount {
+			if total := totalCounts[acc]; total > 0 && shown < total {
+				showHeaders = true
+				break
+			}
+		}
+		if !showHeaders {
+			for acc := range nextOffsets {
+				if nextOffsets[acc] > 0 {
+					showHeaders = true
+					break
+				}
+			}
+		}
+	}
+
+	var atts []Attachment
+	var lastAccount string
 	for i, e := range emails {
-		atts[i] = buildEmailAttachment(e, m.cfg.CallbackURL, m.cfg.WebhookSecret)
+		if showHeaders && e.Account != lastAccount {
+			shown := shownPerAccount[e.Account]
+			total := totalCounts[e.Account]
+			var headerText string
+			if total > 0 && shown < total {
+				headerText = fmt.Sprintf("**%s** · %d of %d", e.Account, shown, total)
+			} else {
+				headerText = "**" + e.Account + "**"
+			}
+			atts = append(atts, Attachment{
+				Text:  headerText,
+				Color: "#4A9EE8",
+			})
+			lastAccount = e.Account
+		}
+		atts = append(atts, buildEmailAttachment(e, m.cfg.CallbackURL, m.cfg.WebhookSecret, sessionTotal))
+
+		// After the last email of a capped account, insert the "load next chunk" button.
+		isLastForAccount := i == len(emails)-1 || emails[i+1].Account != e.Account
+		if isLastForAccount {
+			if offset, ok := nextOffsets[e.Account]; ok && offset > 0 {
+				atts = append(atts, buildNextChunkAttachment(e.Account, offset, m.cfg.CallbackURL, m.cfg.WebhookSecret))
+			}
+		}
 	}
 
 	_, err := m.postWithAttachments(header, atts)
 	return err
 }
 
-func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string) Attachment {
+func buildNextChunkAttachment(account string, offset int, callbackURL, webhookSecret string) Attachment {
+	return Attachment{
+		Color: "#888888",
+		Actions: []Action{{
+			ID:    "nc" + strconv.Itoa(offset),
+			Name:  "Load next 25",
+			Type:  "button",
+			Style: "primary",
+			Integration: &Integration{
+				URL: callbackURL + "/actions/email",
+				Context: map[string]any{
+					"action":         "next_chunk",
+					"account":        account,
+					"offset":         offset,
+					"webhook_secret": webhookSecret,
+				},
+			},
+		}},
+	}
+}
+
+func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sessionTotal int) Attachment {
 	actionURL := callbackURL + "/actions/email"
 	base := map[string]any{
 		"msg_id":         e.MsgID,
@@ -128,7 +207,7 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string) Atta
 		color = "#FFD700"
 	}
 
-	title := fmt.Sprintf("[%d] %s — %s", e.Number, e.Subject, e.From)
+	title := fmt.Sprintf("[%d/%d] %s — %s", e.Number, sessionTotal, e.Subject, e.From)
 
 	// Action IDs are number-based so they work for any account type (Gmail or IMAP).
 	// Mattermost's router requires alphanumeric-only action IDs.
@@ -168,6 +247,13 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string) Atta
 			Type:        "button",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("move")},
 		},
+		Action{
+			ID:          "dl" + n,
+			Name:        "Delete",
+			Type:        "button",
+			Style:       "danger",
+			Integration: &Integration{URL: actionURL, Context: mkCtx("delete")},
+		},
 	)
 
 	att := Attachment{
@@ -182,6 +268,12 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string) Atta
 	}
 
 	return att
+}
+
+// SendPromptWithButton posts a message with a single action button.
+func (m *Mattermost) SendPromptWithButton(message string, action Action) error {
+	_, err := m.postWithAttachments(message, []Attachment{{Actions: []Action{action}}})
+	return err
 }
 
 // PostMessage sends a plain text message to the DM channel.

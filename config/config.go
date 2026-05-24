@@ -24,6 +24,7 @@ type Account struct {
 	Port            int    `yaml:"port"`
 	Password        string `yaml:"password"`
 	ArchiveMailbox  string `yaml:"archive_mailbox"` // IMAP only; defaults to "Archive"
+	TrashMailbox    string `yaml:"trash_mailbox"`   // IMAP only; defaults to "Trash"
 	TokenFile string `yaml:"token_file"`
 }
 
@@ -104,6 +105,71 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// RenameAccount reads the config at path, renames the matching account, and writes it back.
+// If the account's token_file was the default (<oldName>_token.json) it is updated to <newName>_token.json.
+func RenameAccount(path, oldName, newName string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("reading config: %w", err)
+	}
+	var raw Config
+	if err := yaml.NewDecoder(f).Decode(&raw); err != nil {
+		f.Close()
+		return fmt.Errorf("parsing config: %w", err)
+	}
+	f.Close()
+
+	found := false
+	for i := range raw.Accounts {
+		if raw.Accounts[i].Name == oldName {
+			raw.Accounts[i].Name = newName
+			if raw.Accounts[i].TokenFile == oldName+"_token.json" {
+				raw.Accounts[i].TokenFile = newName + "_token.json"
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("account %q not found in config", oldName)
+	}
+
+	out, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("writing config: %w", err)
+	}
+	defer out.Close()
+	enc := yaml.NewEncoder(out)
+	enc.SetIndent(2)
+	return enc.Encode(&raw)
+}
+
+// AppendAccount reads the config at path, appends acc to the accounts list, and writes it back.
+// It re-reads from disk so env-var overrides (OLLAMA_TOKEN etc.) are never written to the file.
+func AppendAccount(path string, acc Account) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("reading config: %w", err)
+	}
+	var raw Config
+	if err := yaml.NewDecoder(f).Decode(&raw); err != nil {
+		f.Close()
+		return fmt.Errorf("parsing config: %w", err)
+	}
+	f.Close()
+
+	raw.Accounts = append(raw.Accounts, acc)
+
+	out, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("writing config: %w", err)
+	}
+	defer out.Close()
+	enc := yaml.NewEncoder(out)
+	enc.SetIndent(2)
+	return enc.Encode(&raw)
 }
 
 func LoadPreferences(path string) (*Preferences, error) {
