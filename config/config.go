@@ -41,6 +41,7 @@ type Ollama struct {
 	Enabled bool   `yaml:"enabled"`
 	Host    string `yaml:"host"`
 	Model   string `yaml:"model"`
+	Token   string `yaml:"token"` // optional Bearer token for authenticated instances
 }
 
 type Preferences struct {
@@ -80,8 +81,14 @@ func Load(path string) (*Config, error) {
 	if cfg.Schedule == "" {
 		cfg.Schedule = "0 7 * * *"
 	}
+	if h := os.Getenv("OLLAMA_HOST"); h != "" {
+		cfg.Ollama.Host = h
+	}
 	if cfg.Ollama.Host == "" {
 		cfg.Ollama.Host = "http://localhost:11434"
+	}
+	if t := os.Getenv("OLLAMA_TOKEN"); t != "" {
+		cfg.Ollama.Token = t
 	}
 	if cfg.Ollama.Model == "" {
 		cfg.Ollama.Model = "llama3.2"
