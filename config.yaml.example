@@ -35,5 +35,6 @@ poll_interval: 30
 
 ollama:
   enabled: false
-  host: http://localhost:11434
-  model: gemma4:latest
+  model: llama3.2               # any model pulled in Ollama
+  # host and token are set via OLLAMA_HOST / OLLAMA_TOKEN env vars in data/.env
+  # host defaults to http://localhost:11434 if not set

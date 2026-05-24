@@ -13,6 +13,8 @@ type pendingOAuth struct {
 	accountName string
 	tokenFile   string
 	expiresAt   time.Time
+	// refresh is called after the token is saved; its return value replaces the live client.
+	refresh func() (email.Actioner, error)
 }
 
 func (h *Handler) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +50,15 @@ func (h *Handler) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 		log.Printf("save token %s: %v", pending.tokenFile, err)
 		http.Error(w, "Failed to save token.", http.StatusInternalServerError)
 		return
+	}
+
+	// Swap in a fresh client so button actions stop getting invalid_grant.
+	if pending.refresh != nil {
+		if newClient, err := pending.refresh(); err == nil {
+			h.Clients[pending.accountName] = newClient
+		} else {
+			log.Printf("refresh client for %s after reauth: %v", pending.accountName, err)
+		}
 	}
 
 	log.Printf("re-authorized Gmail account %q", pending.accountName)

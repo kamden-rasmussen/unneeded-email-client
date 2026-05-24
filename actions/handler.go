@@ -35,8 +35,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 }
 
 // StartGmailReauth generates an OAuth2 authorization URL for re-authorizing a Gmail account.
-// The user visits the URL in their browser; on completion the callback saves the new token.
-func (h *Handler) StartGmailReauth(accountName, tokenFile string) (string, error) {
+// refresh is called after the new token is saved; its return value replaces the live client entry.
+func (h *Handler) StartGmailReauth(accountName, tokenFile string, refresh func() (email.Actioner, error)) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -51,6 +51,7 @@ func (h *Handler) StartGmailReauth(accountName, tokenFile string) (string, error
 		accountName: accountName,
 		tokenFile:   tokenFile,
 		expiresAt:   time.Now().Add(10 * time.Minute),
+		refresh:     refresh,
 	})
 	return authURL, nil
 }
@@ -106,6 +107,9 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 
 	switch ctx.Action {
 	case "archive":
+		if err := client.MarkRead(ctx.MsgID); err != nil {
+			log.Printf("mark_read before archive %s: %v", ctx.EmailID, err)
+		}
 		if err := client.Archive(ctx.MsgID); err != nil {
 			log.Printf("archive %s: %v", ctx.EmailID, err)
 			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
@@ -296,82 +300,61 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 
 // --- helpers ---
 
-// markedDoneProps fetches the post, clears buttons on the matching attachment,
-// and returns updated props suitable for inclusion in a button response "update".
+// markedDoneProps returns updated props for a button response "update".
+// Uses the cached attachment data so other buttons retain their integration contexts
+// (Mattermost strips integration.context from GetPost responses).
 func markedDoneProps(mm *notify.Mattermost, postID string, number int, label string) (map[string]any, error) {
-	post, err := mm.GetPost(postID)
-	if err != nil {
-		return nil, err
+	_, atts, ok := mm.GetDigestPost(postID)
+	if !ok {
+		return nil, fmt.Errorf("post %s not in digest cache", postID)
 	}
 
-	props, _ := post["props"].(map[string]any)
-	rawAtts, _ := props["attachments"].([]any)
-
-	for i, rawAtt := range rawAtts {
-		att, ok := rawAtt.(map[string]any)
-		if !ok {
-			continue
-		}
+	for i, att := range atts {
 		if attachmentOwnsNumber(att, number) {
-			text, _ := att["text"].(string)
-			if text != "" {
-				att["text"] = text + "\n\n**" + label + " ✓**"
+			if att.Text != "" {
+				atts[i].Text = att.Text + "\n\n**" + label + " ✓**"
 			} else {
-				att["text"] = "**" + label + " ✓**"
+				atts[i].Text = "**" + label + " ✓**"
 			}
-			att["actions"] = nil
-			rawAtts[i] = att
+			atts[i].Actions = nil
 			break
 		}
 	}
 
-	return map[string]any{"attachments": rawAtts}, nil
+	mm.UpdateDigestPost(postID, atts)
+	return map[string]any{"attachments": atts}, nil
 }
 
 // updatePostDone patches the post directly (used after dialog submissions, which
 // cannot return an "update" in their response).
 func updatePostDone(mm *notify.Mattermost, postID string, number int, label string) error {
-	post, err := mm.GetPost(postID)
-	if err != nil {
-		return fmt.Errorf("get post: %w", err)
+	message, atts, ok := mm.GetDigestPost(postID)
+	if !ok {
+		return fmt.Errorf("post %s not in digest cache", postID)
 	}
 
-	props, _ := post["props"].(map[string]any)
-	msg, _ := post["message"].(string)
-	rawAtts, _ := props["attachments"].([]any)
-
-	for i, rawAtt := range rawAtts {
-		att, ok := rawAtt.(map[string]any)
-		if !ok {
-			continue
-		}
+	for i, att := range atts {
 		if attachmentOwnsNumber(att, number) {
-			text, _ := att["text"].(string)
-			if text != "" {
-				att["text"] = text + "\n\n**" + label + " ✓**"
+			if att.Text != "" {
+				atts[i].Text = att.Text + "\n\n**" + label + " ✓**"
 			} else {
-				att["text"] = "**" + label + " ✓**"
+				atts[i].Text = "**" + label + " ✓**"
 			}
-			att["actions"] = nil
-			rawAtts[i] = att
+			atts[i].Actions = nil
 			break
 		}
 	}
 
-	return mm.PatchPost(postID, msg, rawAtts)
+	mm.UpdateDigestPost(postID, atts)
+	return mm.PatchPost(postID, message, atts)
 }
 
 // attachmentOwnsNumber checks whether the attachment contains actions for the given digest number.
-// Action IDs are formatted as "{2-char-prefix}{number}" (e.g. "ar1", "rd2"). We match by checking
-// that the ID after the 2-char prefix equals the number exactly, avoiding false matches on
-// multi-digit numbers (e.g. "ar1" must not match number 11).
-func attachmentOwnsNumber(att map[string]any, number int) bool {
+// Action IDs are formatted as "{2-char-prefix}{number}" (e.g. "ar1", "rd2").
+func attachmentOwnsNumber(att notify.Attachment, number int) bool {
 	numStr := strconv.Itoa(number)
-	actions, _ := att["actions"].([]any)
-	for _, rawAction := range actions {
-		action, _ := rawAction.(map[string]any)
-		id, _ := action["id"].(string)
-		if len(id) > 2 && id[2:] == numStr {
+	for _, a := range att.Actions {
+		if len(a.ID) > 2 && a.ID[2:] == numStr {
 			return true
 		}
 	}

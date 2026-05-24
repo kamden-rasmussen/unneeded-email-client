@@ -94,7 +94,10 @@ func main() {
 		if tokenFile == "" {
 			tokenFile = acc.Name + "_token.json"
 		}
-		url, err := ah.StartGmailReauth(acc.Name, tokenFile)
+		refresh := func() (email.Actioner, error) {
+			return email.NewGmailClient(acc)
+		}
+		url, err := ah.StartGmailReauth(acc.Name, tokenFile, refresh)
 		if err != nil {
 			log.Printf("start reauth for %s: %v", acc.Name, err)
 			return
