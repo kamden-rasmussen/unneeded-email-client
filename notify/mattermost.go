@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,21 +89,22 @@ func (m *Mattermost) SendDigest(emails []email.Email) error {
 
 	atts := make([]Attachment, len(emails))
 	for i, e := range emails {
-		atts[i] = buildEmailAttachment(e, m.cfg.CallbackURL)
+		atts[i] = buildEmailAttachment(e, m.cfg.CallbackURL, m.cfg.WebhookSecret)
 	}
 
 	_, err := m.postWithAttachments(header, atts)
 	return err
 }
 
-func buildEmailAttachment(e email.Email, callbackURL string) Attachment {
+func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string) Attachment {
 	actionURL := callbackURL + "/actions/email"
 	base := map[string]any{
-		"gmail_id":      strings.TrimPrefix(e.ID, "gmail-"),
-		"account":       e.Account,
-		"email_id":      e.ID,
-		"number":        e.Number,
-		"sender_domain": email.SenderDomain(e.FromAddr),
+		"msg_id":         e.MsgID,
+		"account":        e.Account,
+		"email_id":       e.ID,
+		"number":         e.Number,
+		"sender_domain":  email.SenderDomain(e.FromAddr),
+		"webhook_secret": webhookSecret,
 	}
 
 	mkCtx := func(action string) map[string]any {
@@ -121,19 +123,18 @@ func buildEmailAttachment(e email.Email, callbackURL string) Attachment {
 
 	title := fmt.Sprintf("[%d] %s — %s", e.Number, e.Subject, e.From)
 
-	// Standard actions — suggestion button prepended if available.
-	var acts []Action
+	// Action IDs are number-based so they work for any account type (Gmail or IMAP).
+	// Mattermost's router requires alphanumeric-only action IDs.
+	n := strconv.Itoa(e.Number)
 
-	// Action IDs must be alphanumeric only — Mattermost's router rejects dashes/underscores
-	// in the {action_id} path parameter. Use a short verb + the raw hex message ID.
-	hexID := strings.TrimPrefix(e.ID, "gmail-")
+	var acts []Action
 
 	if e.Suggestion != nil {
 		sugCtx := mkCtx("move_direct")
 		sugCtx["label_id"] = e.Suggestion.ID
 		sugCtx["label_name"] = e.Suggestion.Name
 		acts = append(acts, Action{
-			ID:          "sug" + hexID,
+			ID:          "sg" + n,
 			Name:        "→ " + e.Suggestion.Name,
 			Type:        "button",
 			Style:       "primary",
@@ -143,19 +144,19 @@ func buildEmailAttachment(e email.Email, callbackURL string) Attachment {
 
 	acts = append(acts,
 		Action{
-			ID:          "ar" + hexID,
+			ID:          "ar" + n,
 			Name:        "Archive",
 			Type:        "button",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("archive")},
 		},
 		Action{
-			ID:          "rd" + hexID,
+			ID:          "rd" + n,
 			Name:        "Mark Read",
 			Type:        "button",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("mark_read")},
 		},
 		Action{
-			ID:          "mo" + hexID,
+			ID:          "mo" + n,
 			Name:        "Move...",
 			Type:        "button",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("move")},

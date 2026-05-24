@@ -1,12 +1,11 @@
-# Sensitive credentials — never commit these
+# Runtime data directory — contains all secrets and live config
+data/
+
+# Legacy locations (kept in case files exist outside data/)
 credentials.json
 gmail_token.json
 *_token.json
-
-# Live config contains webhook URLs and email addresses
 config.yaml
-
-# Database
 *.db
 
 # Compiled binary

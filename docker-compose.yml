@@ -4,5 +4,7 @@ services:
     ports:
       - "8090:8090"
     volumes:
-      - .:/data
+      - ./data:/data
+    env_file:
+      - ./data/.env
     restart: unless-stopped

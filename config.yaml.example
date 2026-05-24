@@ -2,16 +2,30 @@ accounts:
   - name: gmail
     type: gmail
     email: you@gmail.com
-    credentials_file: credentials.json
-    token_file: gmail_token.json
+    token_file: gmail_token.json  # optional; defaults to <name>_token.json
+
+  - name: icloud
+    type: imap
+    email: you@icloud.com
+    password: your-app-specific-password  # generate at appleid.apple.com
+    host: imap.mail.me.com
+    port: 993
+    archive_mailbox: Archive  # iCloud's archive folder name (default: Archive)
+
+  # additional Gmail account example:
+  # - name: work
+  #   type: gmail
+  #   email: you@company.com
+  #   token_file: work_token.json  # optional; defaults to work_token.json
 
 mattermost:
   bot_token: xxxxxxxxxxxxxxxxxxxxxxxxxxxx   # Bot token from Mattermost
   server_url: https://your.mattermost.com  # No trailing slash
   dm_user: your_mattermost_username
   username: Email Agent
-  callback_url: http://YOUR_SERVER_IP:8090  # How Mattermost reaches this machine
-  port: 8090                                # Port this agent listens on
+  callback_url: https://email-agent.example.com  # How Mattermost reaches this machine (HTTPS required for public URLs)
+  port: 8090                                     # Local port to listen on
+  webhook_secret: change-me-to-a-random-secret   # Required when callback_url is set; protects action endpoints
 
 schedule: "0 7 * * *"
 

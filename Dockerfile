@@ -9,5 +9,6 @@ FROM alpine:latest
 RUN apk --no-cache add ca-certificates tzdata
 WORKDIR /data
 COPY --from=builder /build/email-agent /usr/local/bin/email-agent
+EXPOSE 8090
 ENTRYPOINT ["email-agent"]
-CMD ["--config", "config.yaml", "--prefs", "preferences.yaml"]
+CMD ["--config", "/data/config.yaml", "--prefs", "/data/preferences.yaml"]
