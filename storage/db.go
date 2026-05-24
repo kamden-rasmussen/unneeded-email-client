@@ -70,8 +70,8 @@ func Open(path string) (*DB, error) {
 			return nil, fmt.Errorf("schema: %w", err)
 		}
 	}
-	// one-time migration: rename msg_id → msg_id (ignore error if already renamed)
-	db.Exec("ALTER TABLE digest_emails RENAME COLUMN msg_id TO msg_id")
+	// one-time migration: rename old gmail_id column to msg_id (no-op if already correct)
+	db.Exec("ALTER TABLE digest_emails RENAME COLUMN gmail_id TO msg_id")
 
 	return &DB{db: db}, nil
 }
