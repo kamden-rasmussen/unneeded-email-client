@@ -8,10 +8,13 @@ import (
 
 // InterpretedCommand is the structured result of natural-language command parsing.
 type InterpretedCommand struct {
-	Action  string `json:"action"`
-	Account string `json:"account,omitempty"`
-	Numbers []int  `json:"numbers,omitempty"`
-	All     bool   `json:"all,omitempty"`
+	Action        string   `json:"action"`
+	Account       string   `json:"account,omitempty"`
+	Numbers       []int    `json:"numbers,omitempty"`
+	All           bool     `json:"all,omitempty"`
+	Sender        string   `json:"sender,omitempty"`
+	FilterActions []string `json:"filter_actions,omitempty"`
+	Label         string   `json:"label,omitempty"`
 }
 
 // Enabled reports whether AI processing is turned on.
@@ -39,6 +42,9 @@ func (p *Processor) Interpret(message string, accounts []string) (*InterpretedCo
 			`{"action":"delete","numbers":[N,...]} — delete emails by digest number`+"\n"+
 			`{"action":"done","numbers":[N,...]} — archive and mark read by number`+"\n"+
 			`{"action":"done","all":true} — archive and mark read all emails`+"\n"+
+			`{"action":"add_filter","sender":"domain.com","filter_actions":["archive"]}`+" — auto-filter future emails from sender; filter_actions can include archive, mark_read, mute, move; add \"label\":\"Name\" for move\n"+
+			`{"action":"list_filters"} — list active auto-filters`+"\n"+
+			`{"action":"remove_filter","sender":"domain.com"} — remove an auto-filter`+"\n"+
 			`{"action":"unknown"} — cannot interpret the message`+"\n\n"+
 			"Available accounts: %s\n\n"+
 			"Reply with ONLY a valid JSON object. No explanation, no markdown fences.\n\n"+
