@@ -149,15 +149,19 @@ func main() {
 		))
 	}
 
-	run := func() error {
-		return digest(cfg, db, processor, notifier, suggesters, counters, reauthFn)
+	run := func(accountFilter string) error {
+		return digest(cfg, db, processor, notifier, suggesters, counters, reauthFn, accountFilter, prefs, actionClients)
+	}
+
+	executeFn := func(text string) (string, error) {
+		return executeCommand(text, cfg.Accounts, db, actionClients, ah, run, processor, prefs, *prefsPath)
 	}
 
 	// Start poll loop — watches DM channel for text commands like "archive 1 2"
-	go pollLoop(cfg, db, actionClients, notifier, ah, run)
+	go pollLoop(cfg.PollInterval, db, notifier, executeFn)
 
 	if *runNow {
-		if err := run(); err != nil {
+		if err := run(""); err != nil {
 			log.Printf("digest error: %v", err)
 		}
 		sig := make(chan os.Signal, 1)
@@ -169,7 +173,7 @@ func main() {
 
 	c := cron.New()
 	if _, err := c.AddFunc(cfg.Schedule, func() {
-		if err := run(); err != nil {
+		if err := run(""); err != nil {
 			log.Printf("digest error: %v", err)
 		}
 	}); err != nil {
@@ -187,7 +191,7 @@ func main() {
 	log.Println("shutting down")
 }
 
-func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *notify.Mattermost, suggesters map[string]email.Suggester, counters map[string]email.Counter, reauthFn func(config.Account)) error {
+func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *notify.Mattermost, suggesters map[string]email.Suggester, counters map[string]email.Counter, reauthFn func(config.Account), accountFilter string, prefs *config.Preferences, actionClients map[string]email.Actioner) error {
 	t0 := time.Now()
 	log.Println("running digest...")
 	now := t0
@@ -197,6 +201,9 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 	nextOffsets := make(map[string]int)
 
 	for _, acc := range cfg.Accounts {
+		if accountFilter != "" && !strings.EqualFold(acc.Name, accountFilter) {
+			continue
+		}
 		tFetch := time.Now()
 		emails, err := fetchAccount(acc, db)
 		if err != nil {
@@ -207,6 +214,15 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 			continue
 		}
 		log.Printf("[%s] fetch: %d emails in %s", acc.Name, len(emails), time.Since(tFetch).Round(time.Millisecond))
+
+		// Apply auto-filters before AI enrichment.
+		if len(prefs.Filters) > 0 {
+			before := len(emails)
+			emails = applyFilters(emails, prefs.Filters, actionClients)
+			if n := before - len(emails); n > 0 {
+				log.Printf("[%s] filters: auto-processed %d emails", acc.Name, n)
+			}
+		}
 
 		// Get total inbox count for "X of Y" display.
 		if c, ok := counters[acc.Name]; ok {
@@ -478,19 +494,17 @@ func buildActionClients(accounts []config.Account) map[string]email.Actioner {
 }
 
 // pollLoop checks the DM channel on an interval for commands from the user.
-func pollLoop(cfg *config.Config, db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost, ah *actions.Handler, digestFn func() error) {
-	interval := time.Duration(cfg.PollInterval) * time.Second
-	ticker := time.NewTicker(interval)
+func pollLoop(intervalSec int, db *storage.DB, mm *notify.Mattermost, executeFn func(string) (string, error)) {
+	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
 	defer ticker.Stop()
-
 	for range ticker.C {
-		if err := processPoll(db, clients, mm, ah, digestFn); err != nil {
+		if err := processPoll(db, mm, executeFn); err != nil {
 			log.Printf("poll: %v", err)
 		}
 	}
 }
 
-func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.Mattermost, ah *actions.Handler, digestFn func() error) error {
+func processPoll(db *storage.DB, mm *notify.Mattermost, executeFn func(string) (string, error)) error {
 	cursor, err := db.GetPollCursor()
 	if err != nil {
 		return err
@@ -499,16 +513,13 @@ func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.M
 		// First startup — set cursor to now so we start listening immediately.
 		return db.SetPollCursor(time.Now().UnixMilli())
 	}
-
 	messages, err := mm.GetNewMessages(cursor)
 	if err != nil {
 		return err
 	}
-
 	now := time.Now().UnixMilli()
-
 	for _, msg := range messages {
-		reply, err := executeCommand(strings.TrimSpace(msg.Message), db, clients, ah, digestFn)
+		reply, err := executeFn(strings.TrimSpace(msg.Message))
 		if err != nil {
 			log.Printf("command %q: %v", msg.Message, err)
 			mm.PostMessage("Error: " + err.Error()) //nolint:errcheck
@@ -518,12 +529,12 @@ func processPoll(db *storage.DB, clients map[string]email.Actioner, mm *notify.M
 			mm.PostMessage(reply) //nolint:errcheck
 		}
 	}
-
 	return db.SetPollCursor(now)
 }
 
-// executeCommand parses and runs a command like "archive 1 3", "read 2", "done all", "check", or "add gmail work".
-func executeCommand(text string, db *storage.DB, clients map[string]email.Actioner, ah *actions.Handler, digestFn func() error) (string, error) {
+// executeCommand parses and runs a command. Known keywords are handled directly;
+// anything else is sent to the local LLM for natural-language interpretation.
+func executeCommand(text string, cfgAccounts []config.Account, db *storage.DB, clients map[string]email.Actioner, ah *actions.Handler, digestFn func(string) error, proc *ai.Processor, prefs *config.Preferences, prefsPath string) (string, error) {
 	fields := strings.Fields(strings.ToLower(text))
 	if len(fields) == 0 {
 		return "", nil
@@ -532,7 +543,23 @@ func executeCommand(text string, db *storage.DB, clients map[string]email.Action
 	action := fields[0]
 
 	if action == "check" || action == "digest" {
-		return "", digestFn()
+		return "", digestFn("")
+	}
+
+	// "list" alone or "list emails" → digest; "list accounts" → account list
+	if action == "list" {
+		if len(fields) > 1 && fields[1] == "accounts" {
+			return listAccountsText(cfgAccounts), nil
+		}
+		return "", digestFn("")
+	}
+
+	if action == "accounts" {
+		return listAccountsText(cfgAccounts), nil
+	}
+
+	if action == "help" {
+		return commandHelp(), nil
 	}
 
 	if action == "add" {
@@ -557,24 +584,83 @@ func executeCommand(text string, db *storage.DB, clients map[string]email.Action
 		return "", nil
 	}
 
-	if len(fields) < 2 {
-		return "", nil
+	if action == "archive" || action == "read" || action == "done" || action == "delete" {
+		if len(fields) < 2 {
+			return fmt.Sprintf("Usage: `%s <number> [number...]` or `%s all`", action, action), nil
+		}
+		return doEmailAction(action, fields[1:], db, clients)
 	}
 
-	if action != "archive" && action != "read" && action != "done" {
-		return "", nil // not a command we recognise, ignore
+	if action == "filter" || action == "filters" {
+		return handleFilterCommand(fields[1:], prefs, prefsPath)
 	}
 
+	// Natural-language fallback via local LLM.
+	if proc != nil && proc.Enabled() {
+		accountNames := make([]string, 0, len(cfgAccounts))
+		for _, a := range cfgAccounts {
+			accountNames = append(accountNames, a.Name)
+		}
+		cmd, err := proc.Interpret(text, accountNames)
+		if err != nil {
+			log.Printf("nlp interpret %q: %v", text, err)
+			return "", nil
+		}
+		log.Printf("nlp interpreted %q → action=%s account=%q numbers=%v all=%v", text, cmd.Action, cmd.Account, cmd.Numbers, cmd.All)
+		switch cmd.Action {
+		case "digest":
+			return "", digestFn(cmd.Account)
+		case "list_accounts":
+			return listAccountsText(cfgAccounts), nil
+		case "add_filter":
+			actions, label := cmd.FilterActions, cmd.Label
+			if len(actions) == 0 {
+				return "Couldn't determine filter actions — try: `filter add amazon.com archive`", nil
+			}
+			f := config.Filter{Sender: cmd.Sender, Actions: actions, LabelName: label}
+			prefs.Filters = append(prefs.Filters, f)
+			if err := config.SavePreferences(prefsPath, prefs); err != nil {
+				return "", fmt.Errorf("saving filter: %w", err)
+			}
+			return fmt.Sprintf("Filter added: emails from **%s** → %s", cmd.Sender, strings.Join(actions, " + ")), nil
+		case "list_filters":
+			return listFiltersText(prefs.Filters), nil
+		case "remove_filter":
+			return removeFilter(cmd.Sender, prefs, prefsPath)
+		case "archive", "read", "done", "delete":
+			var toks []string
+			if cmd.All {
+				toks = []string{"all"}
+			} else {
+				for _, n := range cmd.Numbers {
+					toks = append(toks, strconv.Itoa(n))
+				}
+			}
+			if len(toks) == 0 {
+				return "Couldn't figure out which emails — try: `archive 1 2` or `archive all`", nil
+			}
+			return doEmailAction(cmd.Action, toks, db, clients)
+		case "unknown":
+			return commandHelp(), nil
+		}
+	}
+
+	return "", nil // silently ignore unrecognised input when LLM is off
+}
+
+// doEmailAction executes archive/read/done/delete against the current digest.
+// toks is either ["all"] or a list of number strings.
+func doEmailAction(action string, toks []string, db *storage.DB, clients map[string]email.Actioner) (string, error) {
 	var targets []storage.DigestEmail
 
-	if fields[1] == "all" {
+	if len(toks) > 0 && toks[0] == "all" {
 		all, err := db.GetAllDigestEmails()
 		if err != nil {
 			return "", err
 		}
 		targets = all
 	} else {
-		for _, tok := range fields[1:] {
+		for _, tok := range toks {
 			n, err := strconv.Atoi(tok)
 			if err != nil {
 				continue
@@ -609,6 +695,10 @@ func executeCommand(text string, db *storage.DB, clients map[string]email.Action
 		case "done":
 			client.Archive(e.MsgID)  //nolint:errcheck
 			client.MarkRead(e.MsgID) //nolint:errcheck
+		case "delete":
+			if err := client.Delete(e.MsgID); err != nil {
+				return "", fmt.Errorf("deleting [%d]: %w", e.Number, err)
+			}
 		}
 		done = append(done, fmt.Sprintf("[%d] %s — %s", e.Number, e.From, e.Subject))
 	}
@@ -617,8 +707,188 @@ func executeCommand(text string, db *storage.DB, clients map[string]email.Action
 		return "", nil
 	}
 
-	verb := map[string]string{"archive": "Archived", "read": "Marked read", "done": "Done"}[action]
+	verb := map[string]string{"archive": "Archived", "read": "Marked read", "done": "Done", "delete": "Deleted"}[action]
 	return fmt.Sprintf("%s ✓\n%s", verb, strings.Join(done, "\n")), nil
+}
+
+func listAccountsText(accounts []config.Account) string {
+	if len(accounts) == 0 {
+		return "No accounts configured."
+	}
+	lines := make([]string, 0, len(accounts))
+	for _, a := range accounts {
+		if a.Email != "" {
+			lines = append(lines, fmt.Sprintf("- **%s** — %s (%s)", a.Name, a.Email, a.Type))
+		} else {
+			lines = append(lines, fmt.Sprintf("- **%s** (%s)", a.Name, a.Type))
+		}
+	}
+	return "**Accounts:**\n" + strings.Join(lines, "\n")
+}
+
+func commandHelp() string {
+	return "**Commands:**\n" +
+		"- `check` / `digest` / `list` — fetch new emails\n" +
+		"- `accounts` / `list accounts` — show configured email accounts\n" +
+		"- `archive <N> [N...]` / `archive all`\n" +
+		"- `read <N> [N...]` / `read all`\n" +
+		"- `delete <N> [N...]`\n" +
+		"- `done <N> [N...]` / `done all` — archive + mark read\n" +
+		"- `filter add <sender> <action...>` — add an auto-filter\n" +
+		"- `filter list` — show active filters\n" +
+		"- `filter remove <sender>` — remove a filter\n" +
+		"- `add gmail <name>` — add a Gmail account\n" +
+		"- `rename <old> <new>` — rename an account\n" +
+		"\nFilter actions: `archive`, `mark_read`, `mute`, `move <label>`\n" +
+		"Or just type naturally: _always archive amazon.com_, _move github.com to Dev_"
+}
+
+// --- filter helpers ---
+
+func handleFilterCommand(args []string, prefs *config.Preferences, prefsPath string) (string, error) {
+	if len(args) == 0 {
+		return listFiltersText(prefs.Filters), nil
+	}
+	switch args[0] {
+	case "list":
+		return listFiltersText(prefs.Filters), nil
+	case "add":
+		if len(args) < 3 {
+			return "Usage: `filter add <sender> archive|mark_read|mute|move <label>`", nil
+		}
+		sender := args[1]
+		actions, labelName := parseFilterActions(args[2:])
+		if len(actions) == 0 {
+			return "Specify at least one action: archive, mark_read, mute, move <label>", nil
+		}
+		prefs.Filters = append(prefs.Filters, config.Filter{Sender: sender, Actions: actions, LabelName: labelName})
+		if err := config.SavePreferences(prefsPath, prefs); err != nil {
+			return "", fmt.Errorf("saving filter: %w", err)
+		}
+		desc := strings.Join(actions, " + ")
+		if labelName != "" {
+			desc += " → " + labelName
+		}
+		return fmt.Sprintf("Filter added: **%s** → %s", sender, desc), nil
+	case "remove", "delete":
+		if len(args) < 2 {
+			return "Usage: `filter remove <sender>`", nil
+		}
+		return removeFilter(args[1], prefs, prefsPath)
+	}
+	return "Usage: `filter list` · `filter add <sender> <actions>` · `filter remove <sender>`", nil
+}
+
+func parseFilterActions(args []string) (actions []string, labelName string) {
+	for i := 0; i < len(args); i++ {
+		switch strings.ToLower(args[i]) {
+		case "archive":
+			actions = append(actions, "archive")
+		case "read", "mark_read":
+			actions = append(actions, "mark_read")
+		case "mute", "skip":
+			actions = append(actions, "mute")
+		case "move":
+			actions = append(actions, "move")
+			if i+1 < len(args) {
+				labelName = strings.Join(args[i+1:], " ")
+				return
+			}
+		}
+	}
+	return
+}
+
+func removeFilter(sender string, prefs *config.Preferences, prefsPath string) (string, error) {
+	var kept []config.Filter
+	for _, f := range prefs.Filters {
+		if !strings.EqualFold(f.Sender, sender) {
+			kept = append(kept, f)
+		}
+	}
+	if len(kept) == len(prefs.Filters) {
+		return fmt.Sprintf("No filter found for **%s**.", sender), nil
+	}
+	prefs.Filters = kept
+	if err := config.SavePreferences(prefsPath, prefs); err != nil {
+		return "", fmt.Errorf("saving filters: %w", err)
+	}
+	return fmt.Sprintf("Filter removed for **%s**.", sender), nil
+}
+
+func listFiltersText(filters []config.Filter) string {
+	if len(filters) == 0 {
+		return "No filters configured. Add one with `filter add <sender> <actions>`."
+	}
+	lines := make([]string, 0, len(filters))
+	for _, f := range filters {
+		desc := strings.Join(f.Actions, " + ")
+		if f.LabelName != "" {
+			desc += " → " + f.LabelName
+		}
+		lines = append(lines, fmt.Sprintf("- **%s** → %s", f.Sender, desc))
+	}
+	return "**Filters:**\n" + strings.Join(lines, "\n")
+}
+
+// applyFilters runs each email against active filters, applies any API actions,
+// and returns only the emails that didn't match (to be shown in the digest).
+func applyFilters(emails []email.Email, filters []config.Filter, clients map[string]email.Actioner) []email.Email {
+	labelCache := make(map[string][]email.Label) // account → labels, fetched lazily
+	var kept []email.Email
+	for _, e := range emails {
+		matched := false
+		for _, f := range filters {
+			if !matchesSender(e.FromAddr, f.Sender) {
+				continue
+			}
+			matched = true
+			client, ok := clients[e.Account]
+			if !ok {
+				break
+			}
+			for _, act := range f.Actions {
+				switch act {
+				case "archive":
+					client.Archive(e.MsgID) //nolint:errcheck
+				case "mark_read":
+					client.MarkRead(e.MsgID) //nolint:errcheck
+				case "mute":
+					// no API call needed — just excluded from digest
+				case "move":
+					if f.LabelName == "" {
+						break
+					}
+					if _, ok := labelCache[e.Account]; !ok {
+						if lbls, err := client.ListLabels(); err == nil {
+							labelCache[e.Account] = lbls
+						}
+					}
+					for _, l := range labelCache[e.Account] {
+						if strings.EqualFold(l.Name, f.LabelName) {
+							client.MoveToLabel(e.MsgID, l.ID) //nolint:errcheck
+							break
+						}
+					}
+				}
+			}
+			break
+		}
+		if !matched {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// matchesSender reports whether fromAddr matches a filter sender pattern.
+// Pattern can be a full address (user@domain.com) or a domain (domain.com).
+func matchesSender(fromAddr, pattern string) bool {
+	from := strings.ToLower(fromAddr)
+	pat := strings.ToLower(strings.TrimPrefix(pattern, "@"))
+	return from == pat ||
+		strings.HasSuffix(from, "@"+pat) ||
+		strings.HasSuffix(from, "."+pat)
 }
 
 // runAuth handles the `email-agent auth [--port N] <type> <name>` subcommand.

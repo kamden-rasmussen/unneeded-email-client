@@ -39,10 +39,11 @@ type Mattermost struct {
 }
 
 type Ollama struct {
-	Enabled bool   `yaml:"enabled"`
-	Host    string `yaml:"host"`
-	Model   string `yaml:"model"`
-	Token   string `yaml:"token"` // optional Bearer token for authenticated instances
+	Enabled  bool   `yaml:"enabled"`
+	Host     string `yaml:"host"`
+	Model    string `yaml:"model"`
+	Token    string `yaml:"token"`    // optional Bearer token for authenticated instances
+	Provider string `yaml:"provider"` // "ollama" (default) or "openai" for OpenAI-compatible APIs (e.g. oMLX)
 }
 
 type Preferences struct {
@@ -51,6 +52,15 @@ type Preferences struct {
 	MuteSubjects []string   `yaml:"mute_subjects"`
 	Categories   []Category `yaml:"categories"`
 	Digest       DigestOpts `yaml:"digest"`
+	Filters      []Filter   `yaml:"filters"`
+}
+
+// Filter auto-processes emails matching a sender pattern before they reach the digest.
+// Actions: "archive", "mark_read", "mute" (skip digest only), "move".
+type Filter struct {
+	Sender    string   `yaml:"sender"`               // domain or full address (case-insensitive)
+	Actions   []string `yaml:"actions"`
+	LabelName string   `yaml:"label_name,omitempty"` // required for "move" action
 }
 
 type Category struct {
@@ -190,4 +200,15 @@ func LoadPreferences(path string) (*Preferences, error) {
 		prefs.Digest.MaxPreviewLength = 150
 	}
 	return &prefs, nil
+}
+
+func SavePreferences(path string, prefs *Preferences) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("writing preferences %s: %w", path, err)
+	}
+	defer f.Close()
+	enc := yaml.NewEncoder(f)
+	enc.SetIndent(2)
+	return enc.Encode(prefs)
 }

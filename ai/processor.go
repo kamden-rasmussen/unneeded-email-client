@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -103,6 +104,13 @@ func (p *Processor) ollamaCategorizate(e *email.Email) (string, error) {
 }
 
 func (p *Processor) generate(prompt string) (string, error) {
+	if p.cfg.Provider == "openai" {
+		return p.generateOpenAI(prompt)
+	}
+	return p.generateOllama(prompt)
+}
+
+func (p *Processor) generateOllama(prompt string) (string, error) {
 	body, err := json.Marshal(map[string]any{
 		"model":  p.cfg.Model,
 		"prompt": prompt,
@@ -111,7 +119,6 @@ func (p *Processor) generate(prompt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
 	req, err := http.NewRequest("POST", p.cfg.Host+"/api/generate", bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -120,17 +127,14 @@ func (p *Processor) generate(prompt string) (string, error) {
 	if p.cfg.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
 	}
-
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("ollama request: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode >= 300 {
 		return "", fmt.Errorf("ollama %d", resp.StatusCode)
 	}
-
 	var result struct {
 		Response string `json:"response"`
 	}
@@ -138,6 +142,50 @@ func (p *Processor) generate(prompt string) (string, error) {
 		return "", fmt.Errorf("ollama response: %w", err)
 	}
 	return result.Response, nil
+}
+
+func (p *Processor) generateOpenAI(prompt string) (string, error) {
+	body, err := json.Marshal(map[string]any{
+		"model": p.cfg.Model,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSuffix(strings.TrimRight(p.cfg.Host, "/"), "/v1")
+	req, err := http.NewRequest("POST", base+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("openai request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("openai %d: %s", resp.StatusCode, b)
+	}
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("openai response: %w", err)
+	}
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("openai: no choices returned")
+	}
+	return result.Choices[0].Message.Content, nil
 }
 
 func (p *Processor) keywordCategorize(e *email.Email) string {
