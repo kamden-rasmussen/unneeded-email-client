@@ -39,10 +39,11 @@ type Mattermost struct {
 }
 
 type Ollama struct {
-	Enabled bool   `yaml:"enabled"`
-	Host    string `yaml:"host"`
-	Model   string `yaml:"model"`
-	Token   string `yaml:"token"` // optional Bearer token for authenticated instances
+	Enabled  bool   `yaml:"enabled"`
+	Host     string `yaml:"host"`
+	Model    string `yaml:"model"`
+	Token    string `yaml:"token"`    // optional Bearer token for authenticated instances
+	Provider string `yaml:"provider"` // "ollama" (default) or "openai" for OpenAI-compatible APIs (e.g. oMLX)
 }
 
 type Preferences struct {
