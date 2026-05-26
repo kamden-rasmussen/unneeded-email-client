@@ -28,8 +28,20 @@ var (
 	runNow     = flag.Bool("now", false, "run digest immediately")
 )
 
+// userCtx holds all per-user state: Mattermost channel, email clients, preferences, and AI processor.
+type userCtx struct {
+	username   string
+	mm         *notify.Mattermost
+	prefs      *config.Preferences
+	prefsPath  string
+	proc       *ai.Processor // carries per-user prefs for IsVIP/IsMuted/Categorize
+	clients    map[string]email.Actioner
+	suggesters map[string]email.Suggester
+	counters   map[string]email.Counter
+	accounts   []config.Account
+}
+
 func main() {
-	// auth subcommand must be checked before flag.Parse so it can have its own args.
 	if len(os.Args) > 1 && os.Args[1] == "auth" {
 		runAuth(os.Args[2:])
 		return
@@ -42,29 +54,37 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	prefs, err := config.LoadPreferences(*prefsPath)
-	if err != nil {
-		log.Fatalf("preferences: %v", err)
-	}
-
 	db, err := storage.Open(cfg.Database)
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
 	defer db.Close()
 
-	notifier := notify.NewMattermost(cfg.Mattermost)
-	processor := ai.New(cfg.Ollama, prefs)
-	actionClients := buildActionClients(cfg.Accounts)
-	suggesters := buildSuggesters(actionClients)
-	counters := buildCounters(actionClients)
+	users := cfg.EffectiveUsers(*prefsPath)
+	if len(users) == 0 {
+		log.Fatal("no users configured — add a 'users' section or set mattermost.dm_user")
+	}
 
-	// Start the HTTP action server for Mattermost button callbacks.
+	userCtxs := buildUserContexts(cfg, users)
+
+	// Union of all clients across users for button-callback routing.
+	allClients := make(map[string]email.Actioner)
+	userMMMap := make(map[string]*notify.Mattermost)
+	for _, uctx := range userCtxs {
+		for name, c := range uctx.clients {
+			allClients[name] = c
+		}
+		userMMMap[uctx.username] = uctx.mm
+	}
+
 	var ah *actions.Handler
 	if cfg.Mattermost.CallbackURL != "" {
+		// Use the first user's MM as the fallback for posts that lack a user context.
+		fallbackMM := userCtxs[users[0].MattermostUser].mm
 		ah = &actions.Handler{
-			Clients:       actionClients,
-			MMClient:      notifier,
+			Clients:       allClients,
+			MMClient:      fallbackMM,
+			UserMMClients: userMMMap,
 			CallbackURL:   cfg.Mattermost.CallbackURL,
 			DB:            db,
 			WebhookSecret: cfg.Mattermost.WebhookSecret,
@@ -74,22 +94,15 @@ func main() {
 					return err
 				}
 				cfg.Accounts = append(cfg.Accounts, acc)
-				if s, ok := client.(email.Suggester); ok {
-					suggesters[acc.Name] = s
-				}
-				if c, ok := client.(email.Counter); ok {
-					counters[acc.Name] = c
-				}
+				allClients[acc.Name] = client
 				return nil
 			},
 			RenameAccount: func(oldName, newName string) error {
-				// Rename token file on disk if it used the default naming convention.
 				oldToken := oldName + "_token.json"
 				newToken := newName + "_token.json"
 				if _, err := os.Stat(oldToken); err == nil {
 					os.Rename(oldToken, newToken) //nolint:errcheck
 				}
-				// Update live cfg.Accounts slice.
 				for i := range cfg.Accounts {
 					if cfg.Accounts[i].Name == oldName {
 						cfg.Accounts[i].Name = newName
@@ -99,15 +112,18 @@ func main() {
 						break
 					}
 				}
-				// Update suggesters map.
-				if s, ok := suggesters[oldName]; ok {
-					suggesters[newName] = s
-					delete(suggesters, oldName)
+				if c, ok := allClients[oldName]; ok {
+					allClients[newName] = c
+					delete(allClients, oldName)
 				}
 				return config.RenameAccount(*configPath, oldName, newName)
 			},
-			NextChunk: func(account string, offset int) error {
-				return loadNextChunk(account, offset, cfg, db, processor, notifier, actionClients, suggesters)
+			NextChunk: func(user, account string, offset int) error {
+				uctx, ok := userCtxs[user]
+				if !ok {
+					return fmt.Errorf("unknown user %q", user)
+				}
+				return loadNextChunk(uctx, account, offset, db)
 			},
 		}
 		mux := http.NewServeMux()
@@ -125,45 +141,28 @@ func main() {
 		}()
 	}
 
-	// reauthFn is called when a Gmail token is expired — posts a re-auth link via DM.
-	reauthFn := func(acc config.Account) {
-		if ah == nil {
-			log.Printf("[%s] token expired but no callback_url configured for re-auth", acc.Name)
-			return
+	// Start a poll loop and wire a digest function for each user.
+	for _, uctx := range userCtxs {
+		uctx := uctx
+		digestFn := func(accountFilter string) error {
+			return digest(uctx, cfg, db, ah, accountFilter)
 		}
-		tokenFile := acc.TokenFile
-		if tokenFile == "" {
-			tokenFile = acc.Name + "_token.json"
+		executeFn := func(text string) (string, error) {
+			return executeCommand(text, uctx, db, ah, digestFn)
 		}
-		refresh := func() (email.Actioner, error) {
-			return email.NewGmailClient(acc)
-		}
-		url, err := ah.StartGmailReauth(acc.Name, tokenFile, refresh)
-		if err != nil {
-			log.Printf("start reauth for %s: %v", acc.Name, err)
-			return
-		}
-		notifier.PostMessage(fmt.Sprintf( //nolint:errcheck
-			"⚠️ Gmail token for **%s** has expired.\n\n[Click here to re-authorize](%s)\n\n_Link expires in 10 minutes._",
-			acc.Name, url,
-		))
+		go pollLoop(cfg.PollInterval, db, uctx.mm, uctx.username, executeFn)
 	}
 
-	run := func(accountFilter string) error {
-		return digest(cfg, db, processor, notifier, suggesters, counters, reauthFn, accountFilter, prefs, actionClients)
+	runAll := func() {
+		for _, uctx := range userCtxs {
+			if err := digest(uctx, cfg, db, ah, ""); err != nil {
+				log.Printf("[%s] digest: %v", uctx.username, err)
+			}
+		}
 	}
-
-	executeFn := func(text string) (string, error) {
-		return executeCommand(text, cfg.Accounts, db, actionClients, ah, run, processor, prefs, *prefsPath)
-	}
-
-	// Start poll loop — watches DM channel for text commands like "archive 1 2"
-	go pollLoop(cfg.PollInterval, db, notifier, executeFn)
 
 	if *runNow {
-		if err := run(""); err != nil {
-			log.Printf("digest error: %v", err)
-		}
+		runAll()
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		log.Println("digest sent — polling for commands (Ctrl+C to quit)")
@@ -172,16 +171,12 @@ func main() {
 	}
 
 	c := cron.New()
-	if _, err := c.AddFunc(cfg.Schedule, func() {
-		if err := run(""); err != nil {
-			log.Printf("digest error: %v", err)
-		}
-	}); err != nil {
+	if _, err := c.AddFunc(cfg.Schedule, runAll); err != nil {
 		log.Fatalf("invalid schedule %q: %v", cfg.Schedule, err)
 	}
 	c.Start()
 
-	log.Printf("email agent running, schedule: %s", cfg.Schedule)
+	log.Printf("email agent running — %d user(s), schedule: %s", len(userCtxs), cfg.Schedule)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -191,16 +186,81 @@ func main() {
 	log.Println("shutting down")
 }
 
-func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *notify.Mattermost, suggesters map[string]email.Suggester, counters map[string]email.Counter, reauthFn func(config.Account), accountFilter string, prefs *config.Preferences, actionClients map[string]email.Actioner) error {
+func buildUserContexts(cfg *config.Config, users []config.User) map[string]*userCtx {
+	accountByName := make(map[string]config.Account)
+	for _, a := range cfg.Accounts {
+		accountByName[a.Name] = a
+	}
+
+	ctxs := make(map[string]*userCtx)
+	for _, u := range users {
+		var userAccounts []config.Account
+		if len(u.Accounts) == 0 {
+			userAccounts = cfg.Accounts
+		} else {
+			for _, name := range u.Accounts {
+				if acc, ok := accountByName[name]; ok {
+					userAccounts = append(userAccounts, acc)
+				} else {
+					log.Printf("[%s] account %q not found in config", u.MattermostUser, name)
+				}
+			}
+		}
+
+		prefs, err := config.LoadPreferences(u.Preferences)
+		if err != nil {
+			log.Printf("[%s] preferences: %v — using defaults", u.MattermostUser, err)
+			prefs = &config.Preferences{Digest: config.DigestOpts{MaxPreviewLength: 150, VIPFirst: true}}
+		}
+
+		clients := buildActionClients(userAccounts)
+		ctxs[u.MattermostUser] = &userCtx{
+			username:   u.MattermostUser,
+			mm:         notify.NewMattermostForUser(cfg.Mattermost, u.MattermostUser),
+			prefs:      prefs,
+			prefsPath:  u.Preferences,
+			proc:       ai.New(cfg.Ollama, prefs),
+			clients:    clients,
+			suggesters: buildSuggesters(clients),
+			counters:   buildCounters(clients),
+			accounts:   userAccounts,
+		}
+	}
+	return ctxs
+}
+
+func digest(uctx *userCtx, cfg *config.Config, db *storage.DB, ah *actions.Handler, accountFilter string) error {
 	t0 := time.Now()
-	log.Println("running digest...")
+	log.Printf("[%s] running digest...", uctx.username)
 	now := t0
+
+	reauthFn := func(acc config.Account) {
+		if ah == nil {
+			log.Printf("[%s] token expired but no callback_url configured for re-auth", acc.Name)
+			return
+		}
+		tokenFile := acc.TokenFile
+		if tokenFile == "" {
+			tokenFile = acc.Name + "_token.json"
+		}
+		url, err := ah.StartGmailReauth(acc.Name, tokenFile, func() (email.Actioner, error) {
+			return email.NewGmailClient(acc)
+		})
+		if err != nil {
+			log.Printf("start reauth for %s: %v", acc.Name, err)
+			return
+		}
+		uctx.mm.PostMessage(fmt.Sprintf( //nolint:errcheck
+			"⚠️ Gmail token for **%s** has expired.\n\n[Click here to re-authorize](%s)\n\n_Link expires in 10 minutes._",
+			acc.Name, url,
+		))
+	}
 
 	var newEmails []email.Email
 	totalCounts := make(map[string]int)
 	nextOffsets := make(map[string]int)
 
-	for _, acc := range cfg.Accounts {
+	for _, acc := range uctx.accounts {
 		if accountFilter != "" && !strings.EqualFold(acc.Name, accountFilter) {
 			continue
 		}
@@ -215,17 +275,15 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 		}
 		log.Printf("[%s] fetch: %d emails in %s", acc.Name, len(emails), time.Since(tFetch).Round(time.Millisecond))
 
-		// Apply auto-filters before AI enrichment.
-		if len(prefs.Filters) > 0 {
+		if len(uctx.prefs.Filters) > 0 {
 			before := len(emails)
-			emails = applyFilters(emails, prefs.Filters, actionClients)
+			emails = applyFilters(emails, uctx.prefs.Filters, uctx.clients)
 			if n := before - len(emails); n > 0 {
 				log.Printf("[%s] filters: auto-processed %d emails", acc.Name, n)
 			}
 		}
 
-		// Get total inbox count for "X of Y" display.
-		if c, ok := counters[acc.Name]; ok {
+		if c, ok := uctx.counters[acc.Name]; ok {
 			if n, err := c.InboxCount(); err == nil {
 				totalCounts[acc.Name] = n
 			} else {
@@ -243,15 +301,13 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 				break
 			}
 			e := &emails[i]
-
-			if proc.IsMuted(e) {
+			if uctx.proc.IsMuted(e) {
 				continue
 			}
-
-			e.VIP = proc.IsVIP(e)
-			e.Category = proc.Categorize(e)
-			e.Preview = proc.Summarize(e)
-
+			e.User = uctx.username
+			e.VIP = uctx.proc.IsVIP(e)
+			e.Category = uctx.proc.Categorize(e)
+			e.Preview = uctx.proc.Summarize(e)
 			newEmails = append(newEmails, *e)
 			accountShown++
 		}
@@ -265,7 +321,6 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 		}
 	}
 
-	// Enrich each email with a suggested destination label.
 	tSuggest := time.Now()
 	for i := range newEmails {
 		e := &newEmails[i]
@@ -273,36 +328,34 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 		if domain == "" {
 			continue
 		}
-		// DB cache first (avoids Gmail API calls for known senders).
-		if sug, err := db.GetSenderSuggestion(domain); err == nil && sug != nil {
+		if sug, err := db.GetSenderSuggestion(uctx.username, domain); err == nil && sug != nil {
 			e.Suggestion = &email.Label{ID: sug.LabelID, Name: sug.LabelName}
 			continue
 		}
-		// Infer from Gmail if we have a client for this account.
-		if s, ok := suggesters[e.Account]; ok {
+		if s, ok := uctx.suggesters[e.Account]; ok {
 			if label, err := s.InferLabel(domain); err == nil && label != nil {
 				e.Suggestion = label
-				db.SetSenderSuggestion(domain, label.ID, label.Name, "inferred") //nolint:errcheck
+				db.SetSenderSuggestion(uctx.username, domain, label.ID, label.Name, "inferred") //nolint:errcheck
 			}
 		}
 	}
-	log.Printf("label suggestions: %s", time.Since(tSuggest).Round(time.Millisecond))
+	log.Printf("[%s] label suggestions: %s", uctx.username, time.Since(tSuggest).Round(time.Millisecond))
 
-	// Assign numbers and save mappings for the poll loop
 	de := make([]storage.DigestEmail, len(newEmails))
 	for i := range newEmails {
 		newEmails[i].Number = i + 1
 		de[i] = storage.DigestEmail{
-			Number:  i + 1,
-			EmailID: newEmails[i].ID,
-			Account: newEmails[i].Account,
-			MsgID:   newEmails[i].MsgID,
-			Subject: newEmails[i].Subject,
-			From:    newEmails[i].From,
+			Number:   i + 1,
+			EmailID:  newEmails[i].ID,
+			Account:  newEmails[i].Account,
+			MsgID:    newEmails[i].MsgID,
+			Subject:  newEmails[i].Subject,
+			From:     newEmails[i].From,
+			FromAddr: newEmails[i].FromAddr,
 		}
 	}
-	if err := db.SaveDigestEmails(de); err != nil {
-		log.Printf("saving digest emails: %v", err)
+	if err := db.SaveDigestEmails(uctx.username, de); err != nil {
+		log.Printf("[%s] saving digest emails: %v", uctx.username, err)
 	}
 
 	tSend := time.Now()
@@ -315,14 +368,12 @@ func digest(cfg *config.Config, db *storage.DB, proc *ai.Processor, notifier *no
 		}
 		log.Printf("[%s] digest: showing %d of %d", acc, shown, total)
 	}
-	if err := notifier.SendDigest(newEmails, totalCounts, nextOffsets); err != nil {
+	if err := uctx.mm.SendDigest(newEmails, totalCounts, nextOffsets); err != nil {
 		return err
 	}
-	log.Printf("mattermost send: %s", time.Since(tSend).Round(time.Millisecond))
-	log.Printf("digest total: %s", time.Since(t0).Round(time.Millisecond))
+	log.Printf("[%s] send: %s, total: %s", uctx.username, time.Since(tSend).Round(time.Millisecond), time.Since(t0).Round(time.Millisecond))
 
-	// Advance the poll cursor so we only process replies after this digest
-	return db.SetPollCursor(time.Now().UnixMilli())
+	return db.SetPollCursor(uctx.username, time.Now().UnixMilli())
 }
 
 func fetchAccount(acc config.Account, db *storage.DB) ([]email.Email, error) {
@@ -373,17 +424,8 @@ const (
 	maxFetchPerAccountConst = 50
 )
 
-func loadNextChunk(
-	account string,
-	offset int,
-	cfg *config.Config,
-	db *storage.DB,
-	proc *ai.Processor,
-	notifier *notify.Mattermost,
-	actionClients map[string]email.Actioner,
-	suggesters map[string]email.Suggester,
-) error {
-	client, ok := actionClients[account]
+func loadNextChunk(uctx *userCtx, account string, offset int, db *storage.DB) error {
+	client, ok := uctx.clients[account]
 	if !ok {
 		return fmt.Errorf("no client for account %q", account)
 	}
@@ -392,13 +434,12 @@ func loadNextChunk(
 		return fmt.Errorf("account %q does not support pagination", account)
 	}
 
-	// Fetch up to 50 starting at offset; show up to 25 after muting.
 	fetched, err := paginator.FetchFrom(offset, maxFetchPerAccountConst)
 	if err != nil {
 		return fmt.Errorf("fetching chunk for %s: %w", account, err)
 	}
 	if len(fetched) == 0 {
-		return notifier.PostMessage(fmt.Sprintf("No more emails to load for **%s**.", account))
+		return uctx.mm.PostMessage(fmt.Sprintf("No more emails to load for **%s**.", account))
 	}
 
 	var chunk []email.Email
@@ -407,21 +448,21 @@ func loadNextChunk(
 			break
 		}
 		e := &fetched[i]
-		if proc.IsMuted(e) {
+		if uctx.proc.IsMuted(e) {
 			continue
 		}
-		e.VIP = proc.IsVIP(e)
-		e.Category = proc.Categorize(e)
-		e.Preview = proc.Summarize(e)
+		e.User = uctx.username
+		e.VIP = uctx.proc.IsVIP(e)
+		e.Category = uctx.proc.Categorize(e)
+		e.Preview = uctx.proc.Summarize(e)
 		chunk = append(chunk, *e)
 	}
 
 	if len(chunk) == 0 {
-		return notifier.PostMessage(fmt.Sprintf("No more emails to load for **%s**.", account))
+		return uctx.mm.PostMessage(fmt.Sprintf("No more emails to load for **%s**.", account))
 	}
 
-	// Assign numbers continuing from the existing digest.
-	maxNum, err := db.MaxDigestNumber()
+	maxNum, err := db.MaxDigestNumber(uctx.username)
 	if err != nil {
 		return err
 	}
@@ -429,44 +470,43 @@ func loadNextChunk(
 	for i := range chunk {
 		chunk[i].Number = maxNum + i + 1
 		de[i] = storage.DigestEmail{
-			Number:  chunk[i].Number,
-			EmailID: chunk[i].ID,
-			Account: chunk[i].Account,
-			MsgID:   chunk[i].MsgID,
-			Subject: chunk[i].Subject,
-			From:    chunk[i].From,
+			Number:   chunk[i].Number,
+			EmailID:  chunk[i].ID,
+			Account:  chunk[i].Account,
+			MsgID:    chunk[i].MsgID,
+			Subject:  chunk[i].Subject,
+			From:     chunk[i].From,
+			FromAddr: chunk[i].FromAddr,
 		}
 	}
-	if err := db.AppendDigestEmails(de); err != nil {
+	if err := db.AppendDigestEmails(uctx.username, de); err != nil {
 		log.Printf("append digest emails: %v", err)
 	}
 
-	// Enrich with label suggestions.
 	for i := range chunk {
 		e := &chunk[i]
 		domain := email.SenderDomain(e.FromAddr)
 		if domain == "" {
 			continue
 		}
-		if sug, err := db.GetSenderSuggestion(domain); err == nil && sug != nil {
+		if sug, err := db.GetSenderSuggestion(uctx.username, domain); err == nil && sug != nil {
 			e.Suggestion = &email.Label{ID: sug.LabelID, Name: sug.LabelName}
 			continue
 		}
-		if s, ok := suggesters[e.Account]; ok {
+		if s, ok := uctx.suggesters[e.Account]; ok {
 			if label, err := s.InferLabel(domain); err == nil && label != nil {
 				e.Suggestion = label
-				db.SetSenderSuggestion(domain, label.ID, label.Name, "inferred") //nolint:errcheck
+				db.SetSenderSuggestion(uctx.username, domain, label.ID, label.Name, "inferred") //nolint:errcheck
 			}
 		}
 	}
 
-	// Show another "load next" button if we hit the per-account cap.
 	var nextOffsets map[string]int
 	if len(chunk) >= maxPerAccountConst {
 		nextOffsets = map[string]int{account: offset + maxPerAccountConst}
 	}
 
-	return notifier.SendDigest(chunk, nil, nextOffsets)
+	return uctx.mm.SendDigest(chunk, nil, nextOffsets)
 }
 
 func buildActionClients(accounts []config.Account) map[string]email.Actioner {
@@ -494,24 +534,23 @@ func buildActionClients(accounts []config.Account) map[string]email.Actioner {
 }
 
 // pollLoop checks the DM channel on an interval for commands from the user.
-func pollLoop(intervalSec int, db *storage.DB, mm *notify.Mattermost, executeFn func(string) (string, error)) {
+func pollLoop(intervalSec int, db *storage.DB, mm *notify.Mattermost, username string, executeFn func(string) (string, error)) {
 	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if err := processPoll(db, mm, executeFn); err != nil {
-			log.Printf("poll: %v", err)
+		if err := processPoll(db, mm, username, executeFn); err != nil {
+			log.Printf("[%s] poll: %v", username, err)
 		}
 	}
 }
 
-func processPoll(db *storage.DB, mm *notify.Mattermost, executeFn func(string) (string, error)) error {
-	cursor, err := db.GetPollCursor()
+func processPoll(db *storage.DB, mm *notify.Mattermost, username string, executeFn func(string) (string, error)) error {
+	cursor, err := db.GetPollCursor(username)
 	if err != nil {
 		return err
 	}
 	if cursor == 0 {
-		// First startup — set cursor to now so we start listening immediately.
-		return db.SetPollCursor(time.Now().UnixMilli())
+		return db.SetPollCursor(username, time.Now().UnixMilli())
 	}
 	messages, err := mm.GetNewMessages(cursor)
 	if err != nil {
@@ -521,7 +560,7 @@ func processPoll(db *storage.DB, mm *notify.Mattermost, executeFn func(string) (
 	for _, msg := range messages {
 		reply, err := executeFn(strings.TrimSpace(msg.Message))
 		if err != nil {
-			log.Printf("command %q: %v", msg.Message, err)
+			log.Printf("[%s] command %q: %v", username, msg.Message, err)
 			mm.PostMessage("Error: " + err.Error()) //nolint:errcheck
 			continue
 		}
@@ -529,12 +568,12 @@ func processPoll(db *storage.DB, mm *notify.Mattermost, executeFn func(string) (
 			mm.PostMessage(reply) //nolint:errcheck
 		}
 	}
-	return db.SetPollCursor(now)
+	return db.SetPollCursor(username, now)
 }
 
 // executeCommand parses and runs a command. Known keywords are handled directly;
 // anything else is sent to the local LLM for natural-language interpretation.
-func executeCommand(text string, cfgAccounts []config.Account, db *storage.DB, clients map[string]email.Actioner, ah *actions.Handler, digestFn func(string) error, proc *ai.Processor, prefs *config.Preferences, prefsPath string) (string, error) {
+func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Handler, digestFn func(string) error) (string, error) {
 	fields := strings.Fields(strings.ToLower(text))
 	if len(fields) == 0 {
 		return "", nil
@@ -546,16 +585,15 @@ func executeCommand(text string, cfgAccounts []config.Account, db *storage.DB, c
 		return "", digestFn("")
 	}
 
-	// "list" alone or "list emails" → digest; "list accounts" → account list
 	if action == "list" {
 		if len(fields) > 1 && fields[1] == "accounts" {
-			return listAccountsText(cfgAccounts), nil
+			return listAccountsText(uctx.accounts), nil
 		}
 		return "", digestFn("")
 	}
 
 	if action == "accounts" {
-		return listAccountsText(cfgAccounts), nil
+		return listAccountsText(uctx.accounts), nil
 	}
 
 	if action == "help" {
@@ -588,45 +626,49 @@ func executeCommand(text string, cfgAccounts []config.Account, db *storage.DB, c
 		if len(fields) < 2 {
 			return fmt.Sprintf("Usage: `%s <number> [number...]` or `%s all`", action, action), nil
 		}
-		return doEmailAction(action, fields[1:], db, clients)
+		return doEmailAction(action, fields[1:], uctx.username, db, uctx.clients)
 	}
 
 	if action == "filter" || action == "filters" {
-		return handleFilterCommand(fields[1:], prefs, prefsPath)
+		if len(fields) > 1 && fields[1] == "add" {
+			if len(fields) < 4 {
+				return "Usage: `filter add <sender> archive|mark_read|mute|move <label>`", nil
+			}
+			filterActions, labelName := parseFilterActions(fields[3:])
+			if len(filterActions) == 0 {
+				return "Specify at least one action: archive, mark_read, mute, move <label>", nil
+			}
+			return proposeFilter(config.Filter{Sender: fields[2], Actions: filterActions, LabelName: labelName}, uctx, ah)
+		}
+		return handleFilterCommand(fields[1:], uctx.prefs, uctx.prefsPath)
 	}
 
 	// Natural-language fallback via local LLM.
-	if proc != nil && proc.Enabled() {
-		accountNames := make([]string, 0, len(cfgAccounts))
-		for _, a := range cfgAccounts {
+	if uctx.proc.Enabled() {
+		accountNames := make([]string, 0, len(uctx.accounts))
+		for _, a := range uctx.accounts {
 			accountNames = append(accountNames, a.Name)
 		}
-		cmd, err := proc.Interpret(text, accountNames)
+		cmd, err := uctx.proc.Interpret(text, accountNames)
 		if err != nil {
-			log.Printf("nlp interpret %q: %v", text, err)
+			log.Printf("[%s] nlp interpret %q: %v", uctx.username, text, err)
 			return "", nil
 		}
-		log.Printf("nlp interpreted %q → action=%s account=%q numbers=%v all=%v", text, cmd.Action, cmd.Account, cmd.Numbers, cmd.All)
+		log.Printf("[%s] nlp: %q → action=%s account=%q numbers=%v all=%v", uctx.username, text, cmd.Action, cmd.Account, cmd.Numbers, cmd.All)
 		switch cmd.Action {
 		case "digest":
 			return "", digestFn(cmd.Account)
 		case "list_accounts":
-			return listAccountsText(cfgAccounts), nil
+			return listAccountsText(uctx.accounts), nil
 		case "add_filter":
-			actions, label := cmd.FilterActions, cmd.Label
-			if len(actions) == 0 {
+			if len(cmd.FilterActions) == 0 {
 				return "Couldn't determine filter actions — try: `filter add amazon.com archive`", nil
 			}
-			f := config.Filter{Sender: cmd.Sender, Actions: actions, LabelName: label}
-			prefs.Filters = append(prefs.Filters, f)
-			if err := config.SavePreferences(prefsPath, prefs); err != nil {
-				return "", fmt.Errorf("saving filter: %w", err)
-			}
-			return fmt.Sprintf("Filter added: emails from **%s** → %s", cmd.Sender, strings.Join(actions, " + ")), nil
+			return proposeFilter(config.Filter{Sender: cmd.Sender, Actions: cmd.FilterActions, LabelName: cmd.Label}, uctx, ah)
 		case "list_filters":
-			return listFiltersText(prefs.Filters), nil
+			return listFiltersText(uctx.prefs.Filters), nil
 		case "remove_filter":
-			return removeFilter(cmd.Sender, prefs, prefsPath)
+			return removeFilter(cmd.Sender, uctx.prefs, uctx.prefsPath)
 		case "archive", "read", "done", "delete":
 			var toks []string
 			if cmd.All {
@@ -639,22 +681,21 @@ func executeCommand(text string, cfgAccounts []config.Account, db *storage.DB, c
 			if len(toks) == 0 {
 				return "Couldn't figure out which emails — try: `archive 1 2` or `archive all`", nil
 			}
-			return doEmailAction(cmd.Action, toks, db, clients)
+			return doEmailAction(cmd.Action, toks, uctx.username, db, uctx.clients)
 		case "unknown":
 			return commandHelp(), nil
 		}
 	}
 
-	return "", nil // silently ignore unrecognised input when LLM is off
+	return "", nil
 }
 
-// doEmailAction executes archive/read/done/delete against the current digest.
-// toks is either ["all"] or a list of number strings.
-func doEmailAction(action string, toks []string, db *storage.DB, clients map[string]email.Actioner) (string, error) {
+// doEmailAction executes archive/read/done/delete against the current digest for a user.
+func doEmailAction(action string, toks []string, username string, db *storage.DB, clients map[string]email.Actioner) (string, error) {
 	var targets []storage.DigestEmail
 
 	if len(toks) > 0 && toks[0] == "all" {
-		all, err := db.GetAllDigestEmails()
+		all, err := db.GetAllDigestEmails(username)
 		if err != nil {
 			return "", err
 		}
@@ -665,7 +706,7 @@ func doEmailAction(action string, toks []string, db *storage.DB, clients map[str
 			if err != nil {
 				continue
 			}
-			e, err := db.GetDigestEmail(n)
+			e, err := db.GetDigestEmail(username, n)
 			if err != nil {
 				continue
 			}
@@ -752,24 +793,6 @@ func handleFilterCommand(args []string, prefs *config.Preferences, prefsPath str
 	switch args[0] {
 	case "list":
 		return listFiltersText(prefs.Filters), nil
-	case "add":
-		if len(args) < 3 {
-			return "Usage: `filter add <sender> archive|mark_read|mute|move <label>`", nil
-		}
-		sender := args[1]
-		actions, labelName := parseFilterActions(args[2:])
-		if len(actions) == 0 {
-			return "Specify at least one action: archive, mark_read, mute, move <label>", nil
-		}
-		prefs.Filters = append(prefs.Filters, config.Filter{Sender: sender, Actions: actions, LabelName: labelName})
-		if err := config.SavePreferences(prefsPath, prefs); err != nil {
-			return "", fmt.Errorf("saving filter: %w", err)
-		}
-		desc := strings.Join(actions, " + ")
-		if labelName != "" {
-			desc += " → " + labelName
-		}
-		return fmt.Sprintf("Filter added: **%s** → %s", sender, desc), nil
 	case "remove", "delete":
 		if len(args) < 2 {
 			return "Usage: `filter remove <sender>`", nil
@@ -777,6 +800,27 @@ func handleFilterCommand(args []string, prefs *config.Preferences, prefsPath str
 		return removeFilter(args[1], prefs, prefsPath)
 	}
 	return "Usage: `filter list` · `filter add <sender> <actions>` · `filter remove <sender>`", nil
+}
+
+// proposeFilter sends a draft filter to the user for approval.
+// Falls back to direct save if no callback URL is configured (no buttons available).
+func proposeFilter(f config.Filter, uctx *userCtx, ah *actions.Handler) (string, error) {
+	if ah == nil {
+		uctx.prefs.Filters = append(uctx.prefs.Filters, f)
+		if err := config.SavePreferences(uctx.prefsPath, uctx.prefs); err != nil {
+			return "", fmt.Errorf("saving filter: %w", err)
+		}
+		desc := strings.Join(f.Actions, " + ")
+		if f.LabelName != "" {
+			desc += " → " + f.LabelName
+		}
+		return fmt.Sprintf("Filter added: **%s** → %s", f.Sender, desc), nil
+	}
+	confirm := func() error {
+		uctx.prefs.Filters = append(uctx.prefs.Filters, f)
+		return config.SavePreferences(uctx.prefsPath, uctx.prefs)
+	}
+	return "", ah.ProposeFilter(uctx.username, f, uctx.mm, confirm)
 }
 
 func parseFilterActions(args []string) (actions []string, labelName string) {
@@ -831,15 +875,14 @@ func listFiltersText(filters []config.Filter) string {
 	return "**Filters:**\n" + strings.Join(lines, "\n")
 }
 
-// applyFilters runs each email against active filters, applies any API actions,
-// and returns only the emails that didn't match (to be shown in the digest).
+// applyFilters runs each email against active filters and returns only unmatched emails.
 func applyFilters(emails []email.Email, filters []config.Filter, clients map[string]email.Actioner) []email.Email {
-	labelCache := make(map[string][]email.Label) // account → labels, fetched lazily
+	labelCache := make(map[string][]email.Label)
 	var kept []email.Email
 	for _, e := range emails {
 		matched := false
 		for _, f := range filters {
-			if !matchesSender(e.FromAddr, f.Sender) {
+			if !email.MatchesSender(e.FromAddr, f.Sender) {
 				continue
 			}
 			matched = true
@@ -854,7 +897,7 @@ func applyFilters(emails []email.Email, filters []config.Filter, clients map[str
 				case "mark_read":
 					client.MarkRead(e.MsgID) //nolint:errcheck
 				case "mute":
-					// no API call needed — just excluded from digest
+					// no API call — just excluded from digest
 				case "move":
 					if f.LabelName == "" {
 						break
@@ -879,16 +922,6 @@ func applyFilters(emails []email.Email, filters []config.Filter, clients map[str
 		}
 	}
 	return kept
-}
-
-// matchesSender reports whether fromAddr matches a filter sender pattern.
-// Pattern can be a full address (user@domain.com) or a domain (domain.com).
-func matchesSender(fromAddr, pattern string) bool {
-	from := strings.ToLower(fromAddr)
-	pat := strings.ToLower(strings.TrimPrefix(pattern, "@"))
-	return from == pat ||
-		strings.HasSuffix(from, "@"+pat) ||
-		strings.HasSuffix(from, "."+pat)
 }
 
 // runAuth handles the `email-agent auth [--port N] <type> <name>` subcommand.

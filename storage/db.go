@@ -21,12 +21,13 @@ type LabelSuggestion struct {
 }
 
 type DigestEmail struct {
-	Number  int
-	EmailID string
-	Account string
-	MsgID   string
-	Subject string
-	From    string
+	Number   int
+	EmailID  string
+	Account  string
+	MsgID    string
+	Subject  string
+	From     string
+	FromAddr string
 }
 
 func Open(path string) (*DB, error) {
@@ -34,6 +35,9 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening db: %w", err)
 	}
+
+	// Migrate old single-user schemas before creating new tables.
+	migrateSchema(db)
 
 	schema := []string{
 		`CREATE TABLE IF NOT EXISTS seen_emails (
@@ -46,23 +50,28 @@ func Open(path string) (*DB, error) {
 			ran_at   DATETIME NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS digest_emails (
-			number    INTEGER PRIMARY KEY,
+			user      TEXT NOT NULL DEFAULT '',
+			number    INTEGER NOT NULL,
 			email_id  TEXT NOT NULL,
 			account   TEXT NOT NULL,
 			msg_id    TEXT NOT NULL,
 			subject   TEXT NOT NULL,
-			from_name TEXT NOT NULL
+			from_name TEXT NOT NULL,
+			from_addr TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (user, number)
 		)`,
 		`CREATE TABLE IF NOT EXISTS poll_state (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS sender_suggestions (
-			domain      TEXT PRIMARY KEY,
+			user        TEXT NOT NULL DEFAULT '',
+			domain      TEXT NOT NULL,
 			label_id    TEXT NOT NULL,
 			label_name  TEXT NOT NULL,
 			source      TEXT NOT NULL DEFAULT 'inferred',
-			updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+			updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (user, domain)
 		)`,
 	}
 	for _, q := range schema {
@@ -70,10 +79,26 @@ func Open(path string) (*DB, error) {
 			return nil, fmt.Errorf("schema: %w", err)
 		}
 	}
-	// one-time migration: rename old gmail_id column to msg_id (no-op if already correct)
-	db.Exec("ALTER TABLE digest_emails RENAME COLUMN gmail_id TO msg_id")
 
 	return &DB{db: db}, nil
+}
+
+// migrateSchema detects old single-user schemas and upgrades them.
+func migrateSchema(db *sql.DB) {
+	// digest_emails: old schema had (number INTEGER PRIMARY KEY) without a user column.
+	// Data is ephemeral so we drop and recreate.
+	var n int
+	if db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('digest_emails') WHERE name='user'`).Scan(&n) == nil && n == 0 {
+		db.Exec("DROP TABLE IF EXISTS digest_emails") //nolint:errcheck
+	}
+
+	// one-time migration: rename old gmail_id column to msg_id (no-op if already correct)
+	db.Exec("ALTER TABLE digest_emails RENAME COLUMN gmail_id TO msg_id") //nolint:errcheck
+
+	// digest_emails: add from_addr column if not present
+	if db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('digest_emails') WHERE name='from_addr'`).Scan(&n) == nil && n == 0 {
+		db.Exec("ALTER TABLE digest_emails ADD COLUMN from_addr TEXT NOT NULL DEFAULT ''") //nolint:errcheck
+	}
 }
 
 func (d *DB) IsSeen(id string) (bool, error) {
@@ -107,21 +132,21 @@ func (d *DB) SetLastRun(account string, t time.Time) error {
 	return err
 }
 
-// SaveDigestEmails replaces the current digest email mappings.
-func (d *DB) SaveDigestEmails(emails []DigestEmail) error {
+// SaveDigestEmails replaces the current digest email mappings for a user.
+func (d *DB) SaveDigestEmails(user string, emails []DigestEmail) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec("DELETE FROM digest_emails"); err != nil {
+	if _, err := tx.Exec("DELETE FROM digest_emails WHERE user = ?", user); err != nil {
 		return err
 	}
 	for _, e := range emails {
 		if _, err := tx.Exec(
-			"INSERT INTO digest_emails (number, email_id, account, msg_id, subject, from_name) VALUES (?, ?, ?, ?, ?, ?)",
-			e.Number, e.EmailID, e.Account, e.MsgID, e.Subject, e.From,
+			"INSERT INTO digest_emails (user, number, email_id, account, msg_id, subject, from_name, from_addr) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			user, e.Number, e.EmailID, e.Account, e.MsgID, e.Subject, e.From, e.FromAddr,
 		); err != nil {
 			return err
 		}
@@ -129,24 +154,24 @@ func (d *DB) SaveDigestEmails(emails []DigestEmail) error {
 	return tx.Commit()
 }
 
-func (d *DB) GetDigestEmail(number int) (DigestEmail, error) {
+func (d *DB) GetDigestEmail(user string, number int) (DigestEmail, error) {
 	var e DigestEmail
 	err := d.db.QueryRow(
-		"SELECT number, email_id, account, msg_id, subject, from_name FROM digest_emails WHERE number = ?",
-		number,
-	).Scan(&e.Number, &e.EmailID, &e.Account, &e.MsgID, &e.Subject, &e.From)
+		"SELECT number, email_id, account, msg_id, subject, from_name, from_addr FROM digest_emails WHERE user = ? AND number = ?",
+		user, number,
+	).Scan(&e.Number, &e.EmailID, &e.Account, &e.MsgID, &e.Subject, &e.From, &e.FromAddr)
 	return e, err
 }
 
-// MaxDigestNumber returns the highest number currently in the digest, or 0 if empty.
-func (d *DB) MaxDigestNumber() (int, error) {
+// MaxDigestNumber returns the highest number currently in the digest for a user, or 0 if empty.
+func (d *DB) MaxDigestNumber(user string) (int, error) {
 	var n int
-	err := d.db.QueryRow("SELECT COALESCE(MAX(number), 0) FROM digest_emails").Scan(&n)
+	err := d.db.QueryRow("SELECT COALESCE(MAX(number), 0) FROM digest_emails WHERE user = ?", user).Scan(&n)
 	return n, err
 }
 
 // AppendDigestEmails inserts new digest email records without clearing existing ones.
-func (d *DB) AppendDigestEmails(emails []DigestEmail) error {
+func (d *DB) AppendDigestEmails(user string, emails []DigestEmail) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -154,8 +179,8 @@ func (d *DB) AppendDigestEmails(emails []DigestEmail) error {
 	defer tx.Rollback()
 	for _, e := range emails {
 		if _, err := tx.Exec(
-			"INSERT OR IGNORE INTO digest_emails (number, email_id, account, msg_id, subject, from_name) VALUES (?, ?, ?, ?, ?, ?)",
-			e.Number, e.EmailID, e.Account, e.MsgID, e.Subject, e.From,
+			"INSERT OR IGNORE INTO digest_emails (user, number, email_id, account, msg_id, subject, from_name, from_addr) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			user, e.Number, e.EmailID, e.Account, e.MsgID, e.Subject, e.From, e.FromAddr,
 		); err != nil {
 			return err
 		}
@@ -163,9 +188,10 @@ func (d *DB) AppendDigestEmails(emails []DigestEmail) error {
 	return tx.Commit()
 }
 
-func (d *DB) GetAllDigestEmails() ([]DigestEmail, error) {
+func (d *DB) GetAllDigestEmails(user string) ([]DigestEmail, error) {
 	rows, err := d.db.Query(
-		"SELECT number, email_id, account, msg_id, subject, from_name FROM digest_emails ORDER BY number",
+		"SELECT number, email_id, account, msg_id, subject, from_name, from_addr FROM digest_emails WHERE user = ? ORDER BY number",
+		user,
 	)
 	if err != nil {
 		return nil, err
@@ -175,7 +201,7 @@ func (d *DB) GetAllDigestEmails() ([]DigestEmail, error) {
 	var emails []DigestEmail
 	for rows.Next() {
 		var e DigestEmail
-		if err := rows.Scan(&e.Number, &e.EmailID, &e.Account, &e.MsgID, &e.Subject, &e.From); err != nil {
+		if err := rows.Scan(&e.Number, &e.EmailID, &e.Account, &e.MsgID, &e.Subject, &e.From, &e.FromAddr); err != nil {
 			return nil, err
 		}
 		emails = append(emails, e)
@@ -183,11 +209,10 @@ func (d *DB) GetAllDigestEmails() ([]DigestEmail, error) {
 	return emails, nil
 }
 
-// GetPollCursor returns the millisecond timestamp to fetch messages after.
-// Returns 0 if no digest has been sent yet.
-func (d *DB) GetPollCursor() (int64, error) {
+// GetPollCursor returns the millisecond timestamp to fetch messages after for a user.
+func (d *DB) GetPollCursor(user string) (int64, error) {
 	var val string
-	err := d.db.QueryRow("SELECT value FROM poll_state WHERE key = 'cursor'").Scan(&val)
+	err := d.db.QueryRow("SELECT value FROM poll_state WHERE key = ?", cursorKey(user)).Scan(&val)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -197,25 +222,31 @@ func (d *DB) GetPollCursor() (int64, error) {
 	return strconv.ParseInt(val, 10, 64)
 }
 
-func (d *DB) SetPollCursor(millis int64) error {
+func (d *DB) SetPollCursor(user string, millis int64) error {
 	_, err := d.db.Exec(
-		"INSERT OR REPLACE INTO poll_state (key, value) VALUES ('cursor', ?)",
-		strconv.FormatInt(millis, 10),
+		"INSERT OR REPLACE INTO poll_state (key, value) VALUES (?, ?)",
+		cursorKey(user), strconv.FormatInt(millis, 10),
 	)
 	return err
 }
 
-// GetSenderSuggestion returns a cached label suggestion for the given sender domain.
-// User-confirmed suggestions never expire; inferred ones expire after 24 hours.
-func (d *DB) GetSenderSuggestion(domain string) (*LabelSuggestion, error) {
+func cursorKey(user string) string {
+	if user == "" {
+		return "cursor"
+	}
+	return "cursor:" + user
+}
+
+// GetSenderSuggestion returns a cached label suggestion for a sender domain scoped to a user.
+func (d *DB) GetSenderSuggestion(user, domain string) (*LabelSuggestion, error) {
 	var sug LabelSuggestion
 	var source string
 	var updatedAt time.Time
 
 	err := d.db.QueryRow(
 		`SELECT domain, label_id, label_name, source, updated_at
-		 FROM sender_suggestions WHERE domain = ?`,
-		domain,
+		 FROM sender_suggestions WHERE user = ? AND domain = ?`,
+		user, domain,
 	).Scan(&sug.Domain, &sug.LabelID, &sug.LabelName, &source, &updatedAt)
 
 	if err == sql.ErrNoRows {
@@ -230,13 +261,12 @@ func (d *DB) GetSenderSuggestion(domain string) (*LabelSuggestion, error) {
 	return &sug, nil
 }
 
-// SetSenderSuggestion upserts a label suggestion for a sender domain.
-// source should be "user" (from an explicit move action) or "inferred" (from Gmail scan).
-func (d *DB) SetSenderSuggestion(domain, labelID, labelName, source string) error {
+// SetSenderSuggestion upserts a label suggestion for a sender domain scoped to a user.
+func (d *DB) SetSenderSuggestion(user, domain, labelID, labelName, source string) error {
 	_, err := d.db.Exec(
-		`INSERT OR REPLACE INTO sender_suggestions (domain, label_id, label_name, source, updated_at)
-		 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		domain, labelID, labelName, source,
+		`INSERT OR REPLACE INTO sender_suggestions (user, domain, label_id, label_name, source, updated_at)
+		 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		user, domain, labelID, labelName, source,
 	)
 	return err
 }
