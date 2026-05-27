@@ -22,6 +22,7 @@ type digestCacheEntry struct {
 
 type Mattermost struct {
 	cfg         config.Mattermost
+	dmUser      string // DM target; overrides cfg.DMUser when set
 	http        *http.Client
 	channelID   string
 	botID       string
@@ -77,8 +78,18 @@ type SelectOption struct {
 
 func NewMattermost(cfg config.Mattermost) *Mattermost {
 	return &Mattermost{
-		cfg:  cfg,
-		http: &http.Client{Timeout: 10 * time.Second},
+		cfg:    cfg,
+		dmUser: cfg.DMUser,
+		http:   &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// NewMattermostForUser returns a Mattermost client that DMs a specific user.
+func NewMattermostForUser(cfg config.Mattermost, dmUser string) *Mattermost {
+	return &Mattermost{
+		cfg:    cfg,
+		dmUser: dmUser,
+		http:   &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -152,7 +163,7 @@ func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int
 		isLastForAccount := i == len(emails)-1 || emails[i+1].Account != e.Account
 		if isLastForAccount {
 			if offset, ok := nextOffsets[e.Account]; ok && offset > 0 {
-				atts = append(atts, buildNextChunkAttachment(e.Account, offset, m.cfg.CallbackURL, m.cfg.WebhookSecret))
+				atts = append(atts, buildNextChunkAttachment(e.User, e.Account, offset, m.cfg.CallbackURL, m.cfg.WebhookSecret))
 			}
 		}
 	}
@@ -161,7 +172,7 @@ func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int
 	return err
 }
 
-func buildNextChunkAttachment(account string, offset int, callbackURL, webhookSecret string) Attachment {
+func buildNextChunkAttachment(user, account string, offset int, callbackURL, webhookSecret string) Attachment {
 	return Attachment{
 		Color: "#888888",
 		Actions: []Action{{
@@ -173,6 +184,7 @@ func buildNextChunkAttachment(account string, offset int, callbackURL, webhookSe
 				URL: callbackURL + "/actions/email",
 				Context: map[string]any{
 					"action":         "next_chunk",
+					"user":           user,
 					"account":        account,
 					"offset":         offset,
 					"webhook_secret": webhookSecret,
@@ -185,6 +197,7 @@ func buildNextChunkAttachment(account string, offset int, callbackURL, webhookSe
 func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sessionTotal int) Attachment {
 	actionURL := callbackURL + "/actions/email"
 	base := map[string]any{
+		"user":           e.User,
 		"msg_id":         e.MsgID,
 		"account":        e.Account,
 		"email_id":       e.ID,
@@ -273,6 +286,12 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 // SendPromptWithButton posts a message with a single action button.
 func (m *Mattermost) SendPromptWithButton(message string, action Action) error {
 	_, err := m.postWithAttachments(message, []Attachment{{Actions: []Action{action}}})
+	return err
+}
+
+// PostAttachment posts a message with one or more attachment cards.
+func (m *Mattermost) PostAttachment(message string, atts ...Attachment) error {
+	_, err := m.postWithAttachments(message, atts)
 	return err
 }
 
@@ -460,7 +479,7 @@ func (m *Mattermost) resolveChannelID() error {
 	}
 	id, err := m.openDMChannel()
 	if err != nil {
-		return fmt.Errorf("opening DM with %q: %w", m.cfg.DMUser, err)
+		return fmt.Errorf("opening DM with %q: %w", m.dmUser, err)
 	}
 	m.channelID = id
 	return nil
@@ -483,9 +502,9 @@ func (m *Mattermost) openDMChannel() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("getting bot user ID: %w", err)
 	}
-	targetID, err := m.userIDByUsername(m.cfg.DMUser)
+	targetID, err := m.userIDByUsername(m.dmUser)
 	if err != nil {
-		return "", fmt.Errorf("getting user ID for %q: %w", m.cfg.DMUser, err)
+		return "", fmt.Errorf("getting user ID for %q: %w", m.dmUser, err)
 	}
 	resp, err := m.apiPost("/channels/direct", []string{botID, targetID})
 	if err != nil {

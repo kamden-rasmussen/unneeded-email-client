@@ -9,6 +9,7 @@ type Email struct {
 	ID         string
 	MsgID      string // account-native message ID (Gmail hex ID or IMAP UID string)
 	Account    string
+	User       string // Mattermost username of the owner
 	From       string
 	FromAddr   string
 	Subject    string
@@ -33,4 +34,13 @@ func SenderDomain(addr string) string {
 		return ""
 	}
 	return strings.ToLower(addr[at+1:])
+}
+
+// MatchesSender reports whether fromAddr matches a filter sender pattern (domain or full address).
+func MatchesSender(fromAddr, pattern string) bool {
+	from := strings.ToLower(fromAddr)
+	pat := strings.ToLower(strings.TrimPrefix(pattern, "@"))
+	return from == pat ||
+		strings.HasSuffix(from, "@"+pat) ||
+		strings.HasSuffix(from, "."+pat)
 }
