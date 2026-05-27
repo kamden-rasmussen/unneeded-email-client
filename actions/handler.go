@@ -35,7 +35,10 @@ type Handler struct {
 	RenameAccount func(oldName, newName string) error
 	// NextChunk is called when a user clicks "load next chunk"; it fetches and
 	// posts the next page of emails for the given account starting at offset.
-	NextChunk     func(user, account string, offset int) error
+	NextChunk func(user, account string, offset int) error
+	// ConfirmFilter is called when a user approves a filter created via the dialog.
+	// It should append the filter to the user's preferences and persist them.
+	ConfirmFilter  func(user string, f config.Filter) error
 	pendingOAuths  sync.Map // state string → *pendingOAuth
 	pendingFilters sync.Map // token string → pendingFilter
 }
@@ -60,6 +63,7 @@ func (h *Handler) getMMForUser(user string) *notify.Mattermost {
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/actions/email", h.handleEmailAction)
 	mux.HandleFunc("/actions/move_dialog", h.handleMoveDialog)
+	mux.HandleFunc("/actions/filter_dialog", h.handleFilterDialog)
 	mux.HandleFunc("/setup/gmail/callback", h.handleGmailCallback)
 	mux.HandleFunc("/setup/imap/start", h.handleIMAPStart)
 	mux.HandleFunc("/setup/imap/callback", h.handleIMAPCallback)
@@ -106,6 +110,7 @@ type actionContext struct {
 	Offset        int    `json:"offset,omitempty"`
 	LabelID       string `json:"label_id,omitempty"`
 	LabelName     string `json:"label_name,omitempty"`
+	FromAddr      string `json:"from_addr,omitempty"`
 	SenderDomain  string `json:"sender_domain,omitempty"`
 	FilterToken   string `json:"filter_token,omitempty"`
 	WebhookSecret string `json:"webhook_secret,omitempty"`
@@ -250,6 +255,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			"move_email",
 			"Move to Folder",
 			string(stateJSON),
+			"Move",
 			[]notify.DialogElement{{
 				DisplayName: "Folder",
 				Name:        "label_id",
@@ -324,12 +330,86 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			}},
 		})
 
+	case "open_filter_dialog":
+		domain := ctx.SenderDomain
+		if domain == "" {
+			domain = ctx.FromAddr
+		}
+		stateJSON, _ := json.Marshal(filterDialogState{
+			User:          ctx.User,
+			FromAddr:      ctx.FromAddr,
+			SenderDomain:  ctx.SenderDomain,
+			WebhookSecret: h.WebhookSecret,
+		})
+		elements := []notify.DialogElement{
+			{
+				DisplayName: "Sender pattern",
+				Name:        "sender",
+				Type:        "text",
+				Default:     domain,
+				Placeholder: "e.g. amazon.com or notify@amazon.com",
+			},
+			{
+				DisplayName: "Archive",
+				Name:        "act_archive",
+				Type:        "bool",
+			},
+			{
+				DisplayName: "Mark as read",
+				Name:        "act_mark_read",
+				Type:        "bool",
+			},
+			{
+				DisplayName: "Delete",
+				Name:        "act_delete",
+				Type:        "bool",
+			},
+			{
+				DisplayName: "Skip inbox (mute)",
+				Name:        "act_mute",
+				Type:        "bool",
+			},
+			{
+				DisplayName: "Move to label",
+				Name:        "act_move",
+				Type:        "bool",
+			},
+			{
+				DisplayName: "Label name (required for Move)",
+				Name:        "label_name",
+				Type:        "text",
+				Optional:    true,
+				Placeholder: "e.g. Newsletters",
+			},
+		}
+		if err := h.getMMForUser(ctx.User).OpenDialog(
+			p.TriggerID,
+			h.CallbackURL+"/actions/filter_dialog",
+			"create_filter",
+			"Create Filter",
+			string(stateJSON),
+			"Create Filter",
+			elements,
+		); err != nil {
+			log.Printf("open filter dialog: %v", err)
+			respondButton(w, buttonResponse{EphemeralText: "Could not open filter dialog: " + err.Error()})
+			return
+		}
+		respondButton(w, buttonResponse{})
+
 	default:
 		respondButton(w, buttonResponse{EphemeralText: "unknown action: " + ctx.Action})
 	}
 }
 
 // --- move dialog submission ---
+
+type filterDialogState struct {
+	User          string `json:"user"`
+	FromAddr      string `json:"from_addr"`
+	SenderDomain  string `json:"sender_domain"`
+	WebhookSecret string `json:"webhook_secret"`
+}
 
 type moveState struct {
 	PostID        string `json:"post_id"`
@@ -418,6 +498,87 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Empty JSON body signals success to Mattermost.
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, "{}")
+}
+
+// --- filter dialog submission ---
+
+func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var sub dialogSubmission
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var state filterDialogState
+	if err := json.Unmarshal([]byte(sub.State), &state); err != nil {
+		respondDialogError(w, "invalid request state")
+		return
+	}
+
+	if !h.validSecret(state.WebhookSecret) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if sub.Cancelled {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	sender := strings.TrimSpace(sub.Submission["sender"])
+	if sender == "" {
+		respondDialogError(w, "sender pattern is required")
+		return
+	}
+
+	var filterActions []string
+	if sub.Submission["act_archive"] == "true" {
+		filterActions = append(filterActions, "archive")
+	}
+	if sub.Submission["act_mark_read"] == "true" {
+		filterActions = append(filterActions, "mark_read")
+	}
+	if sub.Submission["act_delete"] == "true" {
+		filterActions = append(filterActions, "delete")
+	}
+	if sub.Submission["act_mute"] == "true" {
+		filterActions = append(filterActions, "mute")
+	}
+	labelName := strings.TrimSpace(sub.Submission["label_name"])
+	if sub.Submission["act_move"] == "true" {
+		filterActions = append(filterActions, "move")
+	}
+
+	if len(filterActions) == 0 {
+		respondDialogError(w, "select at least one action")
+		return
+	}
+
+	f := config.Filter{
+		Sender:    sender,
+		Actions:   filterActions,
+		LabelName: labelName,
+	}
+
+	if h.ConfirmFilter == nil {
+		respondDialogError(w, "filter saving is not configured")
+		return
+	}
+
+	confirm := func() error {
+		return h.ConfirmFilter(state.User, f)
+	}
+
+	mm := h.getMMForUser(state.User)
+	if err := h.ProposeFilter(state.User, f, mm, confirm); err != nil {
+		log.Printf("propose filter from dialog: %v", err)
+		respondDialogError(w, "Error proposing filter: "+err.Error())
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "{}")
 }
@@ -517,6 +678,8 @@ func (h *Handler) applyFilterToExisting(user string, f config.Filter) int {
 				client.Archive(de.MsgID) //nolint:errcheck
 			case "mark_read":
 				client.MarkRead(de.MsgID) //nolint:errcheck
+			case "delete":
+				client.Delete(de.MsgID) //nolint:errcheck
 			case "mute":
 				// no-op: email is already in the digest
 			case "move":

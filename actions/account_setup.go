@@ -177,6 +177,7 @@ func (h *Handler) handleIMAPStart(w http.ResponseWriter, r *http.Request) {
 		"imap_setup",
 		title,
 		string(stateJSON),
+		"Next",
 		elements,
 	); err != nil {
 		log.Printf("open imap dialog: %v", err)

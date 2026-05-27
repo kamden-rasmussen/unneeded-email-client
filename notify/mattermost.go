@@ -202,6 +202,7 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 		"account":        e.Account,
 		"email_id":       e.ID,
 		"number":         e.Number,
+		"from_addr":      e.FromAddr,
 		"sender_domain":  email.SenderDomain(e.FromAddr),
 		"webhook_secret": webhookSecret,
 	}
@@ -266,6 +267,12 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 			Type:        "button",
 			Style:       "danger",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("delete")},
+		},
+		Action{
+			ID:          "cf" + n,
+			Name:        "Create Filter...",
+			Type:        "button",
+			Integration: &Integration{URL: actionURL, Context: mkCtx("open_filter_dialog")},
 		},
 	)
 
@@ -375,7 +382,7 @@ func (m *Mattermost) PatchPost(postID, message string, attachments []Attachment)
 }
 
 // OpenDialog opens a Mattermost interactive dialog triggered by a button click.
-func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state string, elements []DialogElement) error {
+func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state, submitLabel string, elements []DialogElement) error {
 	body := map[string]any{
 		"trigger_id": triggerID,
 		"url":        submitURL,
@@ -383,7 +390,7 @@ func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state s
 			"callback_id":  callbackID,
 			"title":        title,
 			"state":        state,
-			"submit_label": "Move",
+			"submit_label": submitLabel,
 			"elements":     elements,
 		},
 	}

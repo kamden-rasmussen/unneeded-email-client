@@ -125,6 +125,14 @@ func main() {
 				}
 				return loadNextChunk(uctx, account, offset, db)
 			},
+			ConfirmFilter: func(user string, f config.Filter) error {
+				uctx, ok := userCtxs[user]
+				if !ok {
+					return fmt.Errorf("unknown user %q", user)
+				}
+				uctx.prefs.Filters = append(uctx.prefs.Filters, f)
+				return config.SavePreferences(uctx.prefsPath, uctx.prefs)
+			},
 		}
 		mux := http.NewServeMux()
 		ah.Register(mux)
