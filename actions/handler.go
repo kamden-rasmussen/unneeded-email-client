@@ -350,32 +350,26 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 				Placeholder: "e.g. amazon.com or notify@amazon.com",
 			},
 			{
-				DisplayName: "Archive",
-				Name:        "act_archive",
-				Type:        "bool",
+				DisplayName: "Action",
+				Name:        "action",
+				Type:        "select",
+				Default:     "archive",
+				Options: []notify.SelectOption{
+					{Text: "Archive", Value: "archive"},
+					{Text: "Delete", Value: "delete"},
+					{Text: "Skip inbox (mute)", Value: "mute"},
+					{Text: "Move to label", Value: "move"},
+					{Text: "Mark as read only", Value: "mark_read"},
+				},
 			},
 			{
-				DisplayName: "Mark as read",
-				Name:        "act_mark_read",
+				DisplayName: "Also mark as read",
+				Name:        "also_mark_read",
 				Type:        "bool",
+				Optional:    true,
 			},
 			{
-				DisplayName: "Delete",
-				Name:        "act_delete",
-				Type:        "bool",
-			},
-			{
-				DisplayName: "Skip inbox (mute)",
-				Name:        "act_mute",
-				Type:        "bool",
-			},
-			{
-				DisplayName: "Move to label",
-				Name:        "act_move",
-				Type:        "bool",
-			},
-			{
-				DisplayName: "Label name (required for Move)",
+				DisplayName: "Label name (for Move to label)",
 				Name:        "label_name",
 				Type:        "text",
 				Optional:    true,
@@ -534,27 +528,32 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var filterActions []string
-	if sub.Submission["act_archive"] == "true" {
-		filterActions = append(filterActions, "archive")
-	}
-	if sub.Submission["act_mark_read"] == "true" {
-		filterActions = append(filterActions, "mark_read")
-	}
-	if sub.Submission["act_delete"] == "true" {
-		filterActions = append(filterActions, "delete")
-	}
-	if sub.Submission["act_mute"] == "true" {
-		filterActions = append(filterActions, "mute")
-	}
+	action := sub.Submission["action"]
 	labelName := strings.TrimSpace(sub.Submission["label_name"])
-	if sub.Submission["act_move"] == "true" {
+
+	var filterActions []string
+	switch action {
+	case "archive":
+		filterActions = append(filterActions, "archive")
+	case "delete":
+		filterActions = append(filterActions, "delete")
+	case "mute":
+		filterActions = append(filterActions, "mute")
+	case "move":
+		if labelName == "" {
+			respondDialogError(w, "label name is required for Move to label")
+			return
+		}
 		filterActions = append(filterActions, "move")
+	case "mark_read":
+		filterActions = append(filterActions, "mark_read")
+	default:
+		respondDialogError(w, "select an action")
+		return
 	}
 
-	if len(filterActions) == 0 {
-		respondDialogError(w, "select at least one action")
-		return
+	if sub.Submission["also_mark_read"] == "true" && action != "mark_read" && action != "delete" {
+		filterActions = append(filterActions, "mark_read")
 	}
 
 	f := config.Filter{
