@@ -9,6 +9,7 @@ import (
 
 type Config struct {
 	Accounts     []Account  `yaml:"accounts"`
+	Users        []User     `yaml:"users"`
 	Mattermost   Mattermost `yaml:"mattermost"`
 	Schedule     string     `yaml:"schedule"`
 	Ollama       Ollama     `yaml:"ollama"`
@@ -72,6 +73,13 @@ type Category struct {
 type DigestOpts struct {
 	VIPFirst         bool `yaml:"vip_first"`
 	MaxPreviewLength int  `yaml:"max_preview_length"`
+}
+
+// User maps a Mattermost username to a subset of email accounts and their own preferences file.
+type User struct {
+	MattermostUser string   `yaml:"mattermost_user"`
+	Accounts       []string `yaml:"accounts"`   // names from the top-level accounts list
+	Preferences    string   `yaml:"preferences"` // path to preferences file
 }
 
 func Load(path string) (*Config, error) {
@@ -200,6 +208,16 @@ func LoadPreferences(path string) (*Preferences, error) {
 		prefs.Digest.MaxPreviewLength = 150
 	}
 	return &prefs, nil
+}
+
+// EffectiveUsers returns the configured users, filling in defaultPrefsPath where no preferences path is set.
+func (cfg *Config) EffectiveUsers(defaultPrefsPath string) []User {
+	for i := range cfg.Users {
+		if cfg.Users[i].Preferences == "" {
+			cfg.Users[i].Preferences = defaultPrefsPath
+		}
+	}
+	return cfg.Users
 }
 
 func SavePreferences(path string, prefs *Preferences) error {
