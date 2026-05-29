@@ -283,14 +283,6 @@ func digest(uctx *userCtx, cfg *config.Config, db *storage.DB, ah *actions.Handl
 		}
 		log.Printf("[%s] fetch: %d emails in %s", acc.Name, len(emails), time.Since(tFetch).Round(time.Millisecond))
 
-		if len(uctx.prefs.Filters) > 0 {
-			before := len(emails)
-			emails = applyFilters(emails, uctx.prefs.Filters, uctx.clients)
-			if n := before - len(emails); n > 0 {
-				log.Printf("[%s] filters: auto-processed %d emails", acc.Name, n)
-			}
-		}
-
 		if c, ok := uctx.counters[acc.Name]; ok {
 			if n, err := c.InboxCount(); err == nil {
 				totalCounts[acc.Name] = n
@@ -828,7 +820,7 @@ func proposeFilter(f config.Filter, uctx *userCtx, ah *actions.Handler) (string,
 		uctx.prefs.Filters = append(uctx.prefs.Filters, f)
 		return config.SavePreferences(uctx.prefsPath, uctx.prefs)
 	}
-	return "", ah.ProposeFilter(uctx.username, f, uctx.mm, confirm)
+	return "", ah.ProposeFilter(uctx.username, "", f, uctx.mm, confirm)
 }
 
 func parseFilterActions(args []string) (actions []string, labelName string) {

@@ -45,6 +45,7 @@ type Handler struct {
 
 type pendingFilter struct {
 	Filter    config.Filter
+	Account   string // Gmail account to create server-side filter in; empty = skip
 	ExpiresAt time.Time
 	Confirm   func() error
 }
@@ -301,6 +302,18 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resultText := "Filter saved ✓\n\n" + filterDescription(pf.Filter)
+		if pf.Account != "" {
+			if creator, ok := h.Clients[pf.Account].(email.FilterCreator); ok {
+				add, remove := gmailFilterLabels(pf.Filter, h.Clients[pf.Account])
+				if err := creator.CreateSenderFilter(pf.Filter.Sender, add, remove); err != nil {
+					log.Printf("create gmail filter for %s: %v", pf.Account, err)
+					resultText += "\n\n⚠️ Could not create filter in Gmail: " + err.Error()
+				} else {
+					log.Printf("created gmail filter for account=%s sender=%s", pf.Account, pf.Filter.Sender)
+					resultText += "\n\nFilter also created in Gmail ✓"
+				}
+			}
+		}
 		if ctx.Action == "approve_filter_apply" {
 			n := h.applyFilterToExisting(ctx.User, pf.Filter)
 			if n > 0 {
@@ -337,6 +350,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		}
 		stateJSON, _ := json.Marshal(filterDialogState{
 			User:          ctx.User,
+			Account:       ctx.Account,
 			FromAddr:      ctx.FromAddr,
 			SenderDomain:  ctx.SenderDomain,
 			WebhookSecret: h.WebhookSecret,
@@ -400,6 +414,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 
 type filterDialogState struct {
 	User          string `json:"user"`
+	Account       string `json:"account"`
 	FromAddr      string `json:"from_addr"`
 	SenderDomain  string `json:"sender_domain"`
 	WebhookSecret string `json:"webhook_secret"`
@@ -592,7 +607,7 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mm := h.getMMForUser(state.User)
-	if err := h.ProposeFilter(state.User, f, mm, confirm); err != nil {
+	if err := h.ProposeFilter(state.User, state.Account, f, mm, confirm); err != nil {
 		log.Printf("filter_dialog: propose filter: %v", err)
 		respondDialogError(w, "Error proposing filter: "+err.Error())
 		return
@@ -606,7 +621,8 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 // --- filter approval ---
 
 // ProposeFilter sends a draft filter card to the user with Approve / Approve+Apply / Cancel buttons.
-func (h *Handler) ProposeFilter(user string, f config.Filter, mm *notify.Mattermost, confirm func() error) error {
+// account is the email account the filter originated from; pass "" when no specific account is known.
+func (h *Handler) ProposeFilter(user, account string, f config.Filter, mm *notify.Mattermost, confirm func() error) error {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		return err
@@ -615,6 +631,7 @@ func (h *Handler) ProposeFilter(user string, f config.Filter, mm *notify.Matterm
 
 	h.pendingFilters.Store(token, pendingFilter{
 		Filter:    f,
+		Account:   account,
 		ExpiresAt: time.Now().Add(10 * time.Minute),
 		Confirm:   confirm,
 	})
@@ -660,6 +677,44 @@ func (h *Handler) ProposeFilter(user string, f config.Filter, mm *notify.Matterm
 		},
 	}
 	return mm.PostAttachment("", att)
+}
+
+// gmailFilterLabels converts our filter actions to Gmail label IDs for a server-side filter.
+func gmailFilterLabels(f config.Filter, client email.Actioner) (addLabels, removeLabels []string) {
+	seen := make(map[string]bool)
+	add := func(s string, dst *[]string) {
+		if !seen[s] {
+			seen[s] = true
+			*dst = append(*dst, s)
+		}
+	}
+	for _, act := range f.Actions {
+		switch act {
+		case "archive":
+			add("INBOX", &removeLabels)
+		case "mark_read":
+			add("UNREAD", &removeLabels)
+		case "delete":
+			add("TRASH", &addLabels)
+			add("INBOX", &removeLabels)
+		case "mute":
+			add("INBOX", &removeLabels)
+		case "move":
+			if f.LabelName == "" {
+				break
+			}
+			add("INBOX", &removeLabels)
+			if labels, err := client.ListLabels(); err == nil {
+				for _, l := range labels {
+					if strings.EqualFold(l.Name, f.LabelName) {
+						add(l.ID, &addLabels)
+						break
+					}
+				}
+			}
+		}
+	}
+	return
 }
 
 func filterDescription(f config.Filter) string {

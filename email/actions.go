@@ -14,6 +14,12 @@ type Actioner interface {
 	ListLabels() ([]Label, error)
 }
 
+// FilterCreator can create server-side email filters.
+// GmailClient implements this; IMAP does not.
+type FilterCreator interface {
+	CreateSenderFilter(from string, addLabels, removeLabels []string) error
+}
+
 // Suggester can infer a destination label for a sender domain by querying
 // existing organized mail. GmailClient implements this; IMAP does not.
 type Suggester interface {

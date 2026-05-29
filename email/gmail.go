@@ -317,6 +317,23 @@ func (g *GmailClient) MarkRead(msgID string) error {
 	return err
 }
 
+// CreateSenderFilter creates a Gmail server-side filter rule for a sender pattern.
+// Bare domains (e.g. "amazon.com") are prefixed with "@" so Gmail matches all senders
+// from that domain. Full addresses (e.g. "notify@amazon.com") are used as-is.
+func (g *GmailClient) CreateSenderFilter(from string, addLabels, removeLabels []string) error {
+	if !strings.Contains(from, "@") {
+		from = "@" + from
+	}
+	_, err := g.svc.Users.Settings.Filters.Create("me", &gmail.Filter{
+		Criteria: &gmail.FilterCriteria{From: from},
+		Action: &gmail.FilterAction{
+			AddLabelIds:    addLabels,
+			RemoveLabelIds: removeLabels,
+		},
+	}).Do()
+	return err
+}
+
 // oauthHTTPClient loads a saved token or runs the browser auth flow.
 func oauthHTTPClient(cfg *oauth2.Config, tokenFile string) (*http.Client, error) {
 	tok, err := loadToken(tokenFile)
