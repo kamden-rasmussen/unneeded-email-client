@@ -438,6 +438,12 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 				Optional:    true,
 			},
 			labelElem,
+			{
+				DisplayName: "Apply to emails already in digest",
+				Name:        "also_apply",
+				Type:        "bool",
+				Optional:    true,
+			},
 		}
 		if err := h.getMMForUser(ctx.User).OpenDialog(
 			p.TriggerID,
@@ -445,7 +451,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			"create_filter",
 			"Create Filter",
 			string(stateJSON),
-			"Next",
+			"Create Filter",
 			elements,
 		); err != nil {
 			log.Printf("open filter dialog: %v", err)
@@ -649,43 +655,59 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 		filterActions = append(filterActions, "mark_read")
 	}
 
-	// Open the confirmation dialog using the trigger_id from this submission.
-	confirmStateJSON, _ := json.Marshal(filterConfirmState{
-		User:          state.User,
-		Account:       state.Account,
-		Sender:        sender,
-		Actions:       filterActions,
-		LabelName:     labelName,
-		WebhookSecret: h.WebhookSecret,
-	})
-
-	actionDesc := strings.Join(filterActions, " + ")
-	if labelName != "" {
-		actionDesc += " → " + labelName
+	f := config.Filter{
+		Sender:    sender,
+		Actions:   filterActions,
+		LabelName: labelName,
 	}
-	title := fmt.Sprintf("Create filter: %s → %s?", sender, actionDesc)
 
-	mm := h.getMMForUser(state.User)
-	if err := mm.OpenDialog(
-		sub.TriggerID,
-		h.CallbackURL+"/actions/filter_confirm",
-		"filter_confirm",
-		title,
-		string(confirmStateJSON),
-		"Create Filter",
-		[]notify.DialogElement{{
-			DisplayName: "Also apply to emails already in digest",
-			Name:        "also_apply",
-			Type:        "bool",
-			Optional:    true,
-		}},
-	); err != nil {
-		log.Printf("filter_dialog: open confirm dialog: %v", err)
-		respondDialogError(w, "Could not open confirmation: "+err.Error())
+	if h.ConfirmFilter == nil {
+		respondDialogError(w, "filter saving is not configured")
+		return
+	}
+	if err := h.ConfirmFilter(state.User, f); err != nil {
+		log.Printf("filter_dialog: save: %v", err)
+		respondDialogError(w, "Error saving filter: "+err.Error())
 		return
 	}
 
-	log.Printf("filter_dialog: opened confirm dialog user=%q sender=%q actions=%v", state.User, sender, filterActions)
+	resultText := "Filter created ✓\n\n" + filterDescription(f)
+
+	if state.Account != "" {
+		if creator, ok := h.Clients[state.Account].(email.FilterCreator); ok {
+			add, remove := gmailFilterLabels(f, h.Clients[state.Account])
+			if err := creator.CreateSenderFilter(f.Sender, add, remove); err != nil {
+				log.Printf("filter_dialog: gmail filter account=%s: %v", state.Account, err)
+				if strings.Contains(err.Error(), "insufficientPermissions") || strings.Contains(err.Error(), "ACCESS_TOKEN_SCOPE_INSUFFICIENT") {
+					resultText += "\n\n⚠️ Gmail needs re-authorization for filter management — sending auth link now."
+					if h.TriggerReauth != nil {
+						h.TriggerReauth(state.Account)
+					}
+				} else {
+					resultText += "\n\n⚠️ Could not create in Gmail: " + err.Error()
+				}
+			} else {
+				log.Printf("filter_dialog: gmail filter created account=%s sender=%s", state.Account, f.Sender)
+				resultText += "\n\nAlso created in Gmail ✓"
+			}
+		}
+	}
+
+	if alsoApply := subBool(sub.Submission, "also_apply"); alsoApply {
+		n := h.applyFilterToExisting(state.User, f)
+		if n > 0 {
+			resultText += fmt.Sprintf("\n\nApplied to %d existing email(s) ✓", n)
+		} else {
+			resultText += "\n\nNo matching emails in current digest."
+		}
+	}
+
+	mm := h.getMMForUser(state.User)
+	if err := mm.PostAttachment("", notify.Attachment{Text: resultText, Color: "#36a64f"}); err != nil {
+		log.Printf("filter_dialog: post result: %v", err)
+	}
+
+	log.Printf("filter_dialog: done user=%q sender=%q actions=%v", state.User, sender, filterActions)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "{}")
 }
