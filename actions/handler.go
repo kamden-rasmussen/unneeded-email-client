@@ -57,6 +57,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/actions/email", h.handleEmailAction)
 	mux.HandleFunc("/actions/move_dialog", h.handleMoveDialog)
 	mux.HandleFunc("/actions/filter_dialog", h.handleFilterDialog)
+	mux.HandleFunc("/actions/delete_confirm", h.handleDeleteConfirmDialog)
 	mux.HandleFunc("/setup/gmail/callback", h.handleGmailCallback)
 	mux.HandleFunc("/setup/imap/start", h.handleIMAPStart)
 	mux.HandleFunc("/setup/imap/callback", h.handleIMAPCallback)
@@ -144,7 +145,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 	// Actions that operate on a specific email require a valid account client.
 	// Filter approval/cancel and dialog-open actions do not.
 	requiresClient := map[string]bool{
-		"archive": true, "mark_read": true, "delete": true,
+		"archive": true, "mark_read": true,
 		"move": true, "move_direct": true,
 	}
 	var client email.Actioner
@@ -212,19 +213,29 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		respondButton(w, resp)
 
 	case "delete":
-		if err := client.Delete(ctx.MsgID); err != nil {
-			log.Printf("delete %s: %v", ctx.EmailID, err)
-			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
+		stateJSON, _ := json.Marshal(deleteConfirmState{
+			PostID:        p.PostID,
+			MsgID:         ctx.MsgID,
+			Account:       ctx.Account,
+			EmailID:       ctx.EmailID,
+			Number:        ctx.Number,
+			User:          ctx.User,
+			WebhookSecret: h.WebhookSecret,
+		})
+		if err := h.getMMForUser(ctx.User).OpenDialog(
+			p.TriggerID,
+			h.CallbackURL+"/actions/delete_confirm",
+			"confirm_delete",
+			"Confirm Delete",
+			string(stateJSON),
+			"Delete",
+			nil,
+		); err != nil {
+			log.Printf("open delete confirm dialog: %v", err)
+			respondButton(w, buttonResponse{EphemeralText: "Could not open confirmation: " + err.Error()})
 			return
 		}
-		log.Printf("deleted %s", ctx.EmailID)
-		mm := h.getMMForUser(ctx.User)
-		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Deleted")
-		resp := buttonResponse{EphemeralText: "Deleted ✓"}
-		if props != nil {
-			resp.Update = &buttonUpdate{Props: props}
-		}
-		respondButton(w, resp)
+		respondButton(w, buttonResponse{})
 
 	case "move":
 		labels, err := client.ListLabels()
@@ -398,6 +409,16 @@ type moveState struct {
 	WebhookSecret string `json:"webhook_secret,omitempty"`
 }
 
+type deleteConfirmState struct {
+	PostID        string `json:"post_id"`
+	MsgID         string `json:"msg_id"`
+	Account       string `json:"account"`
+	EmailID       string `json:"email_id"`
+	Number        int    `json:"number"`
+	User          string `json:"user,omitempty"`
+	WebhookSecret string `json:"webhook_secret,omitempty"`
+}
+
 type dialogSubmission struct {
 	CallbackID string         `json:"callback_id"`
 	TriggerID  string         `json:"trigger_id"`
@@ -485,6 +506,57 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Empty JSON body signals success to Mattermost.
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, "{}")
+}
+
+// --- delete confirmation dialog ---
+
+func (h *Handler) handleDeleteConfirmDialog(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var sub dialogSubmission
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var state deleteConfirmState
+	if err := json.Unmarshal([]byte(sub.State), &state); err != nil {
+		respondDialogError(w, "invalid state")
+		return
+	}
+
+	if !h.validSecret(state.WebhookSecret) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if sub.Cancelled {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	client, ok := h.Clients[state.Account]
+	if !ok {
+		respondDialogError(w, "unknown account: "+state.Account)
+		return
+	}
+
+	if err := client.Delete(state.MsgID); err != nil {
+		log.Printf("delete %s: %v", state.EmailID, err)
+		respondDialogError(w, "Error deleting email: "+err.Error())
+		return
+	}
+
+	log.Printf("deleted %s", state.EmailID)
+
+	if state.PostID != "" {
+		mm := h.getMMForUser(state.User)
+		if err := updatePostDone(mm, state.PostID, state.Number, "Deleted"); err != nil {
+			log.Printf("update post %s: %v", state.PostID, err)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "{}")
 }
