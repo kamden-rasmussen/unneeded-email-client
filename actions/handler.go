@@ -148,10 +148,21 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := p.Context
-	client, ok := h.Clients[ctx.Account]
-	if !ok {
-		respondButton(w, buttonResponse{EphemeralText: "unknown account: " + ctx.Account})
-		return
+
+	// Actions that operate on a specific email require a valid account client.
+	// Filter approval/cancel and dialog-open actions do not.
+	requiresClient := map[string]bool{
+		"archive": true, "mark_read": true, "delete": true,
+		"move": true, "move_direct": true,
+	}
+	var client email.Actioner
+	if requiresClient[ctx.Action] {
+		var ok bool
+		client, ok = h.Clients[ctx.Account]
+		if !ok {
+			respondButton(w, buttonResponse{EphemeralText: "unknown account: " + ctx.Account})
+			return
+		}
 	}
 
 	switch ctx.Action {
@@ -355,6 +366,28 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			SenderDomain:  ctx.SenderDomain,
 			WebhookSecret: h.WebhookSecret,
 		})
+
+		// Build label options from the account's actual labels/folders.
+		labelElem := notify.DialogElement{
+			DisplayName: "Label / Folder (for Move)",
+			Name:        "label_name",
+			Optional:    true,
+		}
+		if c, ok := h.Clients[ctx.Account]; ok {
+			if labels, err := c.ListLabels(); err == nil && len(labels) > 0 {
+				opts := make([]notify.SelectOption, len(labels))
+				for i, l := range labels {
+					opts[i] = notify.SelectOption{Text: l.Name, Value: l.Name}
+				}
+				labelElem.Type = "select"
+				labelElem.Options = opts
+			}
+		}
+		if labelElem.Type == "" {
+			labelElem.Type = "text"
+			labelElem.Placeholder = "e.g. Newsletters"
+		}
+
 		elements := []notify.DialogElement{
 			{
 				DisplayName: "Sender pattern",
@@ -372,7 +405,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 					{Text: "Archive", Value: "archive"},
 					{Text: "Delete", Value: "delete"},
 					{Text: "Skip inbox (mute)", Value: "mute"},
-					{Text: "Move to label", Value: "move"},
+					{Text: "Move to label / folder", Value: "move"},
 					{Text: "Mark as read only", Value: "mark_read"},
 				},
 			},
@@ -382,13 +415,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 				Type:        "bool",
 				Optional:    true,
 			},
-			{
-				DisplayName: "Label name (for Move to label)",
-				Name:        "label_name",
-				Type:        "text",
-				Optional:    true,
-				Placeholder: "e.g. Newsletters",
-			},
+			labelElem,
 		}
 		if err := h.getMMForUser(ctx.User).OpenDialog(
 			p.TriggerID,
