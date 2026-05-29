@@ -36,21 +36,10 @@ type Handler struct {
 	// NextChunk is called when a user clicks "load next chunk"; it fetches and
 	// posts the next page of emails for the given account starting at offset.
 	NextChunk func(user, account string, offset int) error
-	// ConfirmFilter is called when a user approves a filter created via the dialog.
-	// It should append the filter to the user's preferences and persist them.
-	ConfirmFilter func(user string, f config.Filter) error
 	// TriggerReauth, when set, initiates OAuth re-authorization for an account
 	// and sends the auth link via Mattermost.
 	TriggerReauth func(accountName string)
-	pendingOAuths  sync.Map // state string → *pendingOAuth
-	pendingFilters sync.Map // token string → pendingFilter
-}
-
-type pendingFilter struct {
-	Filter    config.Filter
-	Account   string // Gmail account to create server-side filter in; empty = skip
-	ExpiresAt time.Time
-	Confirm   func() error
+	pendingOAuths sync.Map // state string → *pendingOAuth
 }
 
 // getMMForUser returns the Mattermost client for the given user, falling back to MMClient.
@@ -68,7 +57,6 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/actions/email", h.handleEmailAction)
 	mux.HandleFunc("/actions/move_dialog", h.handleMoveDialog)
 	mux.HandleFunc("/actions/filter_dialog", h.handleFilterDialog)
-	mux.HandleFunc("/actions/filter_confirm", h.handleFilterConfirmDialog)
 	mux.HandleFunc("/setup/gmail/callback", h.handleGmailCallback)
 	mux.HandleFunc("/setup/imap/start", h.handleIMAPStart)
 	mux.HandleFunc("/setup/imap/callback", h.handleIMAPCallback)
@@ -300,82 +288,6 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 
-	case "approve_filter", "approve_filter_apply":
-		val, ok := h.pendingFilters.LoadAndDelete(ctx.FilterToken)
-		if !ok {
-			respondButton(w, buttonResponse{EphemeralText: "This filter approval has expired or was already handled."})
-			return
-		}
-		pf := val.(pendingFilter)
-		if time.Now().After(pf.ExpiresAt) {
-			respondButton(w, buttonResponse{EphemeralText: "This filter approval has expired."})
-			return
-		}
-		if err := pf.Confirm(); err != nil {
-			log.Printf("confirm filter: %v", err)
-			respondButton(w, buttonResponse{EphemeralText: "Error saving filter: " + err.Error()})
-			return
-		}
-		resultText := "Filter saved ✓\n\n" + filterDescription(pf.Filter)
-		if pf.Account != "" {
-			if creator, ok := h.Clients[pf.Account].(email.FilterCreator); ok {
-				add, remove := gmailFilterLabels(pf.Filter, h.Clients[pf.Account])
-				if err := creator.CreateSenderFilter(pf.Filter.Sender, add, remove); err != nil {
-					log.Printf("create gmail filter for %s: %v", pf.Account, err)
-					resultText += "\n\n⚠️ Could not create filter in Gmail: " + err.Error()
-				} else {
-					log.Printf("created gmail filter for account=%s sender=%s", pf.Account, pf.Filter.Sender)
-					resultText += "\n\nFilter also created in Gmail ✓"
-				}
-			}
-		}
-		if ctx.Action == "approve_filter_apply" {
-			n := h.applyFilterToExisting(ctx.User, pf.Filter)
-			if n > 0 {
-				resultText += fmt.Sprintf("\n\nApplied to %d existing email(s).", n)
-			} else {
-				resultText += "\n\nNo matching emails found in current digest."
-			}
-		}
-		respondButton(w, buttonResponse{
-			EphemeralText: "Filter saved ✓",
-			Update: &buttonUpdate{Props: map[string]any{
-				"attachments": []notify.Attachment{{Text: resultText, Color: "#36a64f"}},
-			}},
-		})
-
-	case "cancel_filter":
-		val, ok := h.pendingFilters.LoadAndDelete(ctx.FilterToken)
-		if !ok {
-			respondButton(w, buttonResponse{EphemeralText: "Already handled."})
-			return
-		}
-		pf := val.(pendingFilter)
-		respondButton(w, buttonResponse{
-			EphemeralText: "Filter cancelled.",
-			Update: &buttonUpdate{Props: map[string]any{
-				"attachments": []notify.Attachment{{Text: "~~" + filterDescription(pf.Filter) + "~~ _(cancelled)_"}},
-			}},
-		})
-
-	case "apply_filter_existing":
-		val, ok := h.pendingFilters.LoadAndDelete(ctx.FilterToken)
-		if !ok {
-			respondButton(w, buttonResponse{EphemeralText: "Already applied or expired."})
-			return
-		}
-		pf := val.(pendingFilter)
-		if time.Now().After(pf.ExpiresAt) {
-			respondButton(w, buttonResponse{EphemeralText: "This action has expired."})
-			return
-		}
-		n := h.applyFilterToExisting(ctx.User, pf.Filter)
-		if n > 0 {
-			respondButton(w, buttonResponse{EphemeralText: fmt.Sprintf("Applied to %d existing email(s) ✓", n)})
-		} else {
-			respondButton(w, buttonResponse{EphemeralText: "No matching emails found in current digest."})
-		}
-
 	case "open_filter_dialog":
 		domain := ctx.SenderDomain
 		if domain == "" {
@@ -473,15 +385,6 @@ type filterDialogState struct {
 	FromAddr      string `json:"from_addr"`
 	SenderDomain  string `json:"sender_domain"`
 	WebhookSecret string `json:"webhook_secret"`
-}
-
-type filterConfirmState struct {
-	User          string   `json:"user"`
-	Account       string   `json:"account"`
-	Sender        string   `json:"sender"`
-	Actions       []string `json:"actions"`
-	LabelName     string   `json:"label_name"`
-	WebhookSecret string   `json:"webhook_secret"`
 }
 
 type moveState struct {
@@ -661,16 +564,6 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 		LabelName: labelName,
 	}
 
-	if h.ConfirmFilter == nil {
-		respondDialogError(w, "filter saving is not configured")
-		return
-	}
-	if err := h.ConfirmFilter(state.User, f); err != nil {
-		log.Printf("filter_dialog: save: %v", err)
-		respondDialogError(w, "Error saving filter: "+err.Error())
-		return
-	}
-
 	resultText := "Filter created ✓\n\n" + filterDescription(f)
 
 	if state.Account != "" {
@@ -710,149 +603,6 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 	log.Printf("filter_dialog: done user=%q sender=%q actions=%v", state.User, sender, filterActions)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "{}")
-}
-
-func (h *Handler) handleFilterConfirmDialog(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var sub dialogSubmission
-	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-
-	var state filterConfirmState
-	if err := json.Unmarshal([]byte(sub.State), &state); err != nil {
-		respondDialogError(w, "invalid state")
-		return
-	}
-
-	if !h.validSecret(state.WebhookSecret) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	if sub.Cancelled {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	f := config.Filter{
-		Sender:    state.Sender,
-		Actions:   state.Actions,
-		LabelName: state.LabelName,
-	}
-
-	if h.ConfirmFilter == nil {
-		respondDialogError(w, "filter saving is not configured")
-		return
-	}
-	if err := h.ConfirmFilter(state.User, f); err != nil {
-		log.Printf("filter_confirm: save: %v", err)
-		respondDialogError(w, "Error saving filter: "+err.Error())
-		return
-	}
-
-	resultText := "Filter created ✓\n\n" + filterDescription(f)
-
-	if state.Account != "" {
-		if creator, ok := h.Clients[state.Account].(email.FilterCreator); ok {
-			add, remove := gmailFilterLabels(f, h.Clients[state.Account])
-			if err := creator.CreateSenderFilter(f.Sender, add, remove); err != nil {
-				log.Printf("filter_confirm: gmail filter account=%s: %v", state.Account, err)
-				if strings.Contains(err.Error(), "insufficientPermissions") || strings.Contains(err.Error(), "ACCESS_TOKEN_SCOPE_INSUFFICIENT") {
-					resultText += "\n\n⚠️ Gmail filter needs re-authorization — sending auth link now."
-					if h.TriggerReauth != nil {
-						h.TriggerReauth(state.Account)
-					}
-				} else {
-					resultText += "\n\n⚠️ Could not create in Gmail: " + err.Error()
-				}
-			} else {
-				log.Printf("filter_confirm: gmail filter created account=%s sender=%s", state.Account, f.Sender)
-				resultText += "\n\nAlso created in Gmail ✓"
-			}
-		}
-	}
-
-	alsoApply := subBool(sub.Submission, "also_apply")
-	if alsoApply {
-		n := h.applyFilterToExisting(state.User, f)
-		if n > 0 {
-			resultText += fmt.Sprintf("\n\nApplied to %d existing email(s) ✓", n)
-		} else {
-			resultText += "\n\nNo matching emails in current digest."
-		}
-	}
-
-	mm := h.getMMForUser(state.User)
-	if err := mm.PostAttachment("", notify.Attachment{Text: resultText, Color: "#36a64f"}); err != nil {
-		log.Printf("filter_confirm: post result: %v", err)
-	}
-
-	log.Printf("filter_confirm: done user=%q sender=%q actions=%v gmail=%s", state.User, state.Sender, state.Actions, state.Account)
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, "{}")
-}
-
-// --- filter approval ---
-
-// ProposeFilter sends a draft filter card to the user with Approve / Approve+Apply / Cancel buttons.
-// account is the email account the filter originated from; pass "" when no specific account is known.
-func (h *Handler) ProposeFilter(user, account string, f config.Filter, mm *notify.Mattermost, confirm func() error) error {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return err
-	}
-	token := hex.EncodeToString(b)
-
-	h.pendingFilters.Store(token, pendingFilter{
-		Filter:    f,
-		Account:   account,
-		ExpiresAt: time.Now().Add(10 * time.Minute),
-		Confirm:   confirm,
-	})
-
-	base := map[string]any{
-		"user":           user,
-		"filter_token":   token,
-		"webhook_secret": h.WebhookSecret,
-	}
-	mkCtx := func(action string) map[string]any {
-		ctx := make(map[string]any, len(base)+1)
-		for k, v := range base {
-			ctx[k] = v
-		}
-		ctx["action"] = action
-		return ctx
-	}
-
-	att := notify.Attachment{
-		Text: "Add this filter?\n\n" + filterDescription(f),
-		Actions: []notify.Action{
-			{
-				ID:    "fa" + token[:6],
-				Name:  "Approve",
-				Type:  "button",
-				Style: "success",
-				Integration: &notify.Integration{URL: h.CallbackURL + "/actions/email", Context: mkCtx("approve_filter")},
-			},
-			{
-				ID:    "faa" + token[:6],
-				Name:  "Approve + Apply to existing",
-				Type:  "button",
-				Style: "primary",
-				Integration: &notify.Integration{URL: h.CallbackURL + "/actions/email", Context: mkCtx("approve_filter_apply")},
-			},
-			{
-				ID:    "fc" + token[:6],
-				Name:  "Cancel",
-				Type:  "button",
-				Style: "danger",
-				Integration: &notify.Integration{URL: h.CallbackURL + "/actions/email", Context: mkCtx("cancel_filter")},
-			},
-		},
-	}
-	return mm.PostAttachment("", att)
 }
 
 // gmailFilterLabels converts our filter actions to Gmail label IDs for a server-side filter.

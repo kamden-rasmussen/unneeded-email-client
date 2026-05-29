@@ -125,14 +125,6 @@ func main() {
 				}
 				return loadNextChunk(uctx, account, offset, db)
 			},
-			ConfirmFilter: func(user string, f config.Filter) error {
-				uctx, ok := userCtxs[user]
-				if !ok {
-					return fmt.Errorf("unknown user %q", user)
-				}
-				uctx.prefs.Filters = append(uctx.prefs.Filters, f)
-				return config.SavePreferences(uctx.prefsPath, uctx.prefs)
-			},
 			TriggerReauth: func(accountName string) {
 				for _, uctx := range userCtxs {
 					for _, acc := range uctx.accounts {
@@ -654,20 +646,6 @@ func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Hand
 		return doEmailAction(action, fields[1:], uctx.username, db, uctx.clients)
 	}
 
-	if action == "filter" || action == "filters" {
-		if len(fields) > 1 && fields[1] == "add" {
-			if len(fields) < 4 {
-				return "Usage: `filter add <sender> archive|mark_read|mute|move <label>`", nil
-			}
-			filterActions, labelName := parseFilterActions(fields[3:])
-			if len(filterActions) == 0 {
-				return "Specify at least one action: archive, mark_read, mute, move <label>", nil
-			}
-			return proposeFilter(config.Filter{Sender: fields[2], Actions: filterActions, LabelName: labelName}, uctx, ah)
-		}
-		return handleFilterCommand(fields[1:], uctx.prefs, uctx.prefsPath)
-	}
-
 	// Natural-language fallback via local LLM.
 	if uctx.proc.Enabled() {
 		accountNames := make([]string, 0, len(uctx.accounts))
@@ -685,15 +663,6 @@ func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Hand
 			return "", digestFn(cmd.Account)
 		case "list_accounts":
 			return listAccountsText(uctx.accounts), nil
-		case "add_filter":
-			if len(cmd.FilterActions) == 0 {
-				return "Couldn't determine filter actions — try: `filter add amazon.com archive`", nil
-			}
-			return proposeFilter(config.Filter{Sender: cmd.Sender, Actions: cmd.FilterActions, LabelName: cmd.Label}, uctx, ah)
-		case "list_filters":
-			return listFiltersText(uctx.prefs.Filters), nil
-		case "remove_filter":
-			return removeFilter(cmd.Sender, uctx.prefs, uctx.prefsPath)
 		case "archive", "read", "done", "delete":
 			var toks []string
 			if cmd.All {
@@ -800,153 +769,9 @@ func commandHelp() string {
 		"- `read <N> [N...]` / `read all`\n" +
 		"- `delete <N> [N...]`\n" +
 		"- `done <N> [N...]` / `done all` — archive + mark read\n" +
-		"- `filter add <sender> <action...>` — add an auto-filter\n" +
-		"- `filter list` — show active filters\n" +
-		"- `filter remove <sender>` — remove a filter\n" +
 		"- `add gmail <name>` — add a Gmail account\n" +
 		"- `rename <old> <new>` — rename an account\n" +
-		"\nFilter actions: `archive`, `mark_read`, `mute`, `move <label>`\n" +
-		"Or just type naturally: _always archive amazon.com_, _move github.com to Dev_"
-}
-
-// --- filter helpers ---
-
-func handleFilterCommand(args []string, prefs *config.Preferences, prefsPath string) (string, error) {
-	if len(args) == 0 {
-		return listFiltersText(prefs.Filters), nil
-	}
-	switch args[0] {
-	case "list":
-		return listFiltersText(prefs.Filters), nil
-	case "remove", "delete":
-		if len(args) < 2 {
-			return "Usage: `filter remove <sender>`", nil
-		}
-		return removeFilter(args[1], prefs, prefsPath)
-	}
-	return "Usage: `filter list` · `filter add <sender> <actions>` · `filter remove <sender>`", nil
-}
-
-// proposeFilter sends a draft filter to the user for approval.
-// Falls back to direct save if no callback URL is configured (no buttons available).
-func proposeFilter(f config.Filter, uctx *userCtx, ah *actions.Handler) (string, error) {
-	if ah == nil {
-		uctx.prefs.Filters = append(uctx.prefs.Filters, f)
-		if err := config.SavePreferences(uctx.prefsPath, uctx.prefs); err != nil {
-			return "", fmt.Errorf("saving filter: %w", err)
-		}
-		desc := strings.Join(f.Actions, " + ")
-		if f.LabelName != "" {
-			desc += " → " + f.LabelName
-		}
-		return fmt.Sprintf("Filter added: **%s** → %s", f.Sender, desc), nil
-	}
-	confirm := func() error {
-		uctx.prefs.Filters = append(uctx.prefs.Filters, f)
-		return config.SavePreferences(uctx.prefsPath, uctx.prefs)
-	}
-	return "", ah.ProposeFilter(uctx.username, "", f, uctx.mm, confirm)
-}
-
-func parseFilterActions(args []string) (actions []string, labelName string) {
-	for i := 0; i < len(args); i++ {
-		switch strings.ToLower(args[i]) {
-		case "archive":
-			actions = append(actions, "archive")
-		case "read", "mark_read":
-			actions = append(actions, "mark_read")
-		case "mute", "skip":
-			actions = append(actions, "mute")
-		case "move":
-			actions = append(actions, "move")
-			if i+1 < len(args) {
-				labelName = strings.Join(args[i+1:], " ")
-				return
-			}
-		}
-	}
-	return
-}
-
-func removeFilter(sender string, prefs *config.Preferences, prefsPath string) (string, error) {
-	var kept []config.Filter
-	for _, f := range prefs.Filters {
-		if !strings.EqualFold(f.Sender, sender) {
-			kept = append(kept, f)
-		}
-	}
-	if len(kept) == len(prefs.Filters) {
-		return fmt.Sprintf("No filter found for **%s**.", sender), nil
-	}
-	prefs.Filters = kept
-	if err := config.SavePreferences(prefsPath, prefs); err != nil {
-		return "", fmt.Errorf("saving filters: %w", err)
-	}
-	return fmt.Sprintf("Filter removed for **%s**.", sender), nil
-}
-
-func listFiltersText(filters []config.Filter) string {
-	if len(filters) == 0 {
-		return "No filters configured. Add one with `filter add <sender> <actions>`."
-	}
-	lines := make([]string, 0, len(filters))
-	for _, f := range filters {
-		desc := strings.Join(f.Actions, " + ")
-		if f.LabelName != "" {
-			desc += " → " + f.LabelName
-		}
-		lines = append(lines, fmt.Sprintf("- **%s** → %s", f.Sender, desc))
-	}
-	return "**Filters:**\n" + strings.Join(lines, "\n")
-}
-
-// applyFilters runs each email against active filters and returns only unmatched emails.
-func applyFilters(emails []email.Email, filters []config.Filter, clients map[string]email.Actioner) []email.Email {
-	labelCache := make(map[string][]email.Label)
-	var kept []email.Email
-	for _, e := range emails {
-		matched := false
-		for _, f := range filters {
-			if !email.MatchesSender(e.FromAddr, f.Sender) {
-				continue
-			}
-			matched = true
-			client, ok := clients[e.Account]
-			if !ok {
-				break
-			}
-			for _, act := range f.Actions {
-				switch act {
-				case "archive":
-					client.Archive(e.MsgID) //nolint:errcheck
-				case "mark_read":
-					client.MarkRead(e.MsgID) //nolint:errcheck
-				case "mute":
-					// no API call — just excluded from digest
-				case "move":
-					if f.LabelName == "" {
-						break
-					}
-					if _, ok := labelCache[e.Account]; !ok {
-						if lbls, err := client.ListLabels(); err == nil {
-							labelCache[e.Account] = lbls
-						}
-					}
-					for _, l := range labelCache[e.Account] {
-						if strings.EqualFold(l.Name, f.LabelName) {
-							client.MoveToLabel(e.MsgID, l.ID) //nolint:errcheck
-							break
-						}
-					}
-				}
-			}
-			break
-		}
-		if !matched {
-			kept = append(kept, e)
-		}
-	}
-	return kept
+		"\nTo create filters, use the **Create Filter...** button on any email card."
 }
 
 // runAuth handles the `email-agent auth [--port N] <type> <name>` subcommand.
