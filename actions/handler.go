@@ -354,6 +354,24 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			}},
 		})
 
+	case "apply_filter_existing":
+		val, ok := h.pendingFilters.LoadAndDelete(ctx.FilterToken)
+		if !ok {
+			respondButton(w, buttonResponse{EphemeralText: "Already applied or expired."})
+			return
+		}
+		pf := val.(pendingFilter)
+		if time.Now().After(pf.ExpiresAt) {
+			respondButton(w, buttonResponse{EphemeralText: "This action has expired."})
+			return
+		}
+		n := h.applyFilterToExisting(ctx.User, pf.Filter)
+		if n > 0 {
+			respondButton(w, buttonResponse{EphemeralText: fmt.Sprintf("Applied to %d existing email(s) ✓", n)})
+		} else {
+			respondButton(w, buttonResponse{EphemeralText: "No matching emails found in current digest."})
+		}
+
 	case "open_filter_dialog":
 		domain := ctx.SenderDomain
 		if domain == "" {
@@ -629,18 +647,65 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	confirm := func() error {
-		return h.ConfirmFilter(state.User, f)
-	}
-
-	mm := h.getMMForUser(state.User)
-	if err := h.ProposeFilter(state.User, state.Account, f, mm, confirm); err != nil {
-		log.Printf("filter_dialog: propose filter: %v", err)
-		respondDialogError(w, "Error proposing filter: "+err.Error())
+	// Save to preferences immediately — the dialog is the review step.
+	if err := h.ConfirmFilter(state.User, f); err != nil {
+		log.Printf("filter_dialog: save filter: %v", err)
+		respondDialogError(w, "Error saving filter: "+err.Error())
 		return
 	}
 
-	log.Printf("filter_dialog: success, proposed filter for user=%q sender=%q actions=%v", state.User, sender, filterActions)
+	resultText := "Filter created ✓\n\n" + filterDescription(f)
+
+	// Create server-side Gmail filter if the account supports it.
+	if state.Account != "" {
+		if creator, ok := h.Clients[state.Account].(email.FilterCreator); ok {
+			add, remove := gmailFilterLabels(f, h.Clients[state.Account])
+			if err := creator.CreateSenderFilter(f.Sender, add, remove); err != nil {
+				log.Printf("filter_dialog: create gmail filter account=%s: %v", state.Account, err)
+				resultText += "\n\n⚠️ Could not create in Gmail: " + err.Error()
+			} else {
+				log.Printf("filter_dialog: gmail filter created account=%s sender=%s", state.Account, f.Sender)
+				resultText += "\n\nAlso created in Gmail ✓"
+			}
+		}
+	}
+
+	// Store a short-lived entry so the user can apply the filter to existing digest emails.
+	var applyBtn []notify.Action
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err == nil {
+		token := hex.EncodeToString(b)
+		h.pendingFilters.Store(token, pendingFilter{
+			Filter:    f,
+			ExpiresAt: time.Now().Add(10 * time.Minute),
+			Confirm:   func() error { return nil },
+		})
+		applyBtn = []notify.Action{{
+			ID:   "afe" + token[:6],
+			Name: "Apply to existing digest emails",
+			Type: "button",
+			Integration: &notify.Integration{
+				URL: h.CallbackURL + "/actions/email",
+				Context: map[string]any{
+					"action":         "apply_filter_existing",
+					"user":           state.User,
+					"filter_token":   token,
+					"webhook_secret": h.WebhookSecret,
+				},
+			},
+		}}
+	}
+
+	mm := h.getMMForUser(state.User)
+	if err := mm.PostAttachment("", notify.Attachment{
+		Text:    resultText,
+		Color:   "#36a64f",
+		Actions: applyBtn,
+	}); err != nil {
+		log.Printf("filter_dialog: post confirmation: %v", err)
+	}
+
+	log.Printf("filter_dialog: done user=%q sender=%q actions=%v", state.User, sender, filterActions)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "{}")
 }
