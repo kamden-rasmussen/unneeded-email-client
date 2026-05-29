@@ -417,10 +417,20 @@ type moveState struct {
 }
 
 type dialogSubmission struct {
-	CallbackID string            `json:"callback_id"`
-	State      string            `json:"state"`
-	Submission map[string]string `json:"submission"`
-	Cancelled  bool              `json:"cancelled"`
+	CallbackID string         `json:"callback_id"`
+	State      string         `json:"state"`
+	Submission map[string]any `json:"submission"`
+	Cancelled  bool           `json:"cancelled"`
+}
+
+func subStr(sub map[string]any, key string) string {
+	v, _ := sub[key].(string)
+	return v
+}
+
+func subBool(sub map[string]any, key string) bool {
+	v, _ := sub[key].(bool)
+	return v
 }
 
 func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
@@ -447,7 +457,7 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	labelID := sub.Submission["label_id"]
+	labelID := subStr(sub.Submission, "label_id")
 	if labelID == "" {
 		respondDialogError(w, "no folder selected")
 		return
@@ -502,34 +512,42 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var sub dialogSubmission
 	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		log.Printf("filter_dialog: decode body: %v", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
+	log.Printf("filter_dialog: callback_id=%q state_len=%d submission=%v cancelled=%v", sub.CallbackID, len(sub.State), sub.Submission, sub.Cancelled)
+
 	var state filterDialogState
 	if err := json.Unmarshal([]byte(sub.State), &state); err != nil {
+		log.Printf("filter_dialog: unmarshal state %q: %v", sub.State, err)
 		respondDialogError(w, "invalid request state")
 		return
 	}
 
 	if !h.validSecret(state.WebhookSecret) {
+		log.Printf("filter_dialog: invalid webhook secret")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	if sub.Cancelled {
+		log.Printf("filter_dialog: cancelled by user")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	sender := strings.TrimSpace(sub.Submission["sender"])
+	sender := strings.TrimSpace(subStr(sub.Submission, "sender"))
 	if sender == "" {
 		respondDialogError(w, "sender pattern is required")
 		return
 	}
 
-	action := sub.Submission["action"]
-	labelName := strings.TrimSpace(sub.Submission["label_name"])
+	action := subStr(sub.Submission, "action")
+	labelName := strings.TrimSpace(subStr(sub.Submission, "label_name"))
+	alsoMarkRead := subBool(sub.Submission, "also_mark_read")
+	log.Printf("filter_dialog: sender=%q action=%q label=%q also_read=%v", sender, action, labelName, alsoMarkRead)
 
 	var filterActions []string
 	switch action {
@@ -548,11 +566,12 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 	case "mark_read":
 		filterActions = append(filterActions, "mark_read")
 	default:
+		log.Printf("filter_dialog: unknown action %q", action)
 		respondDialogError(w, "select an action")
 		return
 	}
 
-	if sub.Submission["also_mark_read"] == "true" && action != "mark_read" && action != "delete" {
+	if alsoMarkRead && action != "mark_read" && action != "delete" {
 		filterActions = append(filterActions, "mark_read")
 	}
 
@@ -563,6 +582,7 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.ConfirmFilter == nil {
+		log.Printf("filter_dialog: ConfirmFilter callback not set")
 		respondDialogError(w, "filter saving is not configured")
 		return
 	}
@@ -573,11 +593,12 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 
 	mm := h.getMMForUser(state.User)
 	if err := h.ProposeFilter(state.User, f, mm, confirm); err != nil {
-		log.Printf("propose filter from dialog: %v", err)
+		log.Printf("filter_dialog: propose filter: %v", err)
 		respondDialogError(w, "Error proposing filter: "+err.Error())
 		return
 	}
 
+	log.Printf("filter_dialog: success, proposed filter for user=%q sender=%q actions=%v", state.User, sender, filterActions)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "{}")
 }
