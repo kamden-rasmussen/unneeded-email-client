@@ -103,6 +103,13 @@ func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {
 				Preview: msg.Snippet,
 			}
 
+			for _, labelID := range msg.LabelIds {
+				if labelID == "UNREAD" {
+					e.Unread = true
+					break
+				}
+			}
+
 			for _, h := range msg.Payload.Headers {
 				switch strings.ToLower(h.Name) {
 				case "from":
@@ -191,6 +198,12 @@ func (g *GmailClient) FetchFrom(offset, limit int) ([]Email, error) {
 			MsgID:   id,
 			Account: g.cfg.Name,
 			Preview: msg.Snippet,
+		}
+		for _, labelID := range msg.LabelIds {
+			if labelID == "UNREAD" {
+				e.Unread = true
+				break
+			}
 		}
 		for _, h := range msg.Payload.Headers {
 			switch strings.ToLower(h.Name) {

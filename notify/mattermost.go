@@ -217,8 +217,11 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 	}
 
 	var color string
-	if e.VIP {
+	switch {
+	case e.VIP:
 		color = "#FFD700"
+	case e.Unread:
+		color = "#1976D2"
 	}
 
 	title := fmt.Sprintf("[%d/%d] %s — %s", e.Number, sessionTotal, e.Subject, e.From)

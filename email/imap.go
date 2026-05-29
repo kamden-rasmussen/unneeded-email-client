@@ -77,7 +77,7 @@ func (ic *IMAPClient) FetchNew(since time.Time) ([]Email, error) {
 	ch := make(chan *imap.Message, 32)
 	done := make(chan error, 1)
 	go func() {
-		done <- ic.c.UidFetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, ch)
+		done <- ic.c.UidFetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid, imap.FetchFlags}, ch)
 	}()
 
 	var emails []Email
@@ -92,6 +92,13 @@ func (ic *IMAPClient) FetchNew(since time.Time) ([]Email, error) {
 			Account: ic.cfg.Name,
 			Date:    msg.Envelope.Date,
 			Subject: msg.Envelope.Subject,
+			Unread:  true,
+		}
+		for _, flag := range msg.Flags {
+			if flag == imap.SeenFlag {
+				e.Unread = false
+				break
+			}
 		}
 		if len(msg.Envelope.From) > 0 {
 			from := msg.Envelope.From[0]

@@ -17,6 +17,7 @@ type Email struct {
 	Date       time.Time
 	Category   string
 	VIP        bool
+	Unread     bool
 	Number     int    // position in digest (1-based)
 	Suggestion *Label // auto-suggested destination label, nil if none
 }
