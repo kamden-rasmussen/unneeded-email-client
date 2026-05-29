@@ -28,7 +28,7 @@ func gmailOAuthConfig() (*oauth2.Config, error) {
 	return &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		Scopes:       []string{gmail.GmailModifyScope},
+		Scopes:       []string{gmail.GmailModifyScope, "https://www.googleapis.com/auth/gmail.settings.basic"},
 		Endpoint:     google.Endpoint,
 	}, nil
 }

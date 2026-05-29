@@ -133,6 +133,31 @@ func main() {
 				uctx.prefs.Filters = append(uctx.prefs.Filters, f)
 				return config.SavePreferences(uctx.prefsPath, uctx.prefs)
 			},
+			TriggerReauth: func(accountName string) {
+				for _, uctx := range userCtxs {
+					for _, acc := range uctx.accounts {
+						if acc.Name != accountName {
+							continue
+						}
+						tokenFile := acc.TokenFile
+						if tokenFile == "" {
+							tokenFile = acc.Name + "_token.json"
+						}
+						url, err := ah.StartGmailReauth(acc.Name, tokenFile, func() (email.Actioner, error) {
+							return email.NewGmailClient(acc)
+						})
+						if err != nil {
+							log.Printf("trigger reauth for %s: %v", accountName, err)
+							return
+						}
+						uctx.mm.PostMessage(fmt.Sprintf( //nolint:errcheck
+							"⚠️ Gmail account **%s** needs re-authorization to manage filters.\n\n[Click here to re-authorize](%s)\n\n_Link expires in 10 minutes._",
+							accountName, url,
+						))
+						return
+					}
+				}
+			},
 		}
 		mux := http.NewServeMux()
 		ah.Register(mux)

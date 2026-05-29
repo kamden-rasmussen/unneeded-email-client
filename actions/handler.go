@@ -38,7 +38,10 @@ type Handler struct {
 	NextChunk func(user, account string, offset int) error
 	// ConfirmFilter is called when a user approves a filter created via the dialog.
 	// It should append the filter to the user's preferences and persist them.
-	ConfirmFilter  func(user string, f config.Filter) error
+	ConfirmFilter func(user string, f config.Filter) error
+	// TriggerReauth, when set, initiates OAuth re-authorization for an account
+	// and sends the auth link via Mattermost.
+	TriggerReauth func(accountName string)
 	pendingOAuths  sync.Map // state string → *pendingOAuth
 	pendingFilters sync.Map // token string → pendingFilter
 }
@@ -662,7 +665,14 @@ func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
 			add, remove := gmailFilterLabels(f, h.Clients[state.Account])
 			if err := creator.CreateSenderFilter(f.Sender, add, remove); err != nil {
 				log.Printf("filter_dialog: create gmail filter account=%s: %v", state.Account, err)
-				resultText += "\n\n⚠️ Could not create in Gmail: " + err.Error()
+				if strings.Contains(err.Error(), "insufficientPermissions") || strings.Contains(err.Error(), "ACCESS_TOKEN_SCOPE_INSUFFICIENT") {
+					resultText += "\n\n⚠️ Gmail filter needs re-authorization — sending auth link now."
+					if h.TriggerReauth != nil {
+						h.TriggerReauth(state.Account)
+					}
+				} else {
+					resultText += "\n\n⚠️ Could not create in Gmail: " + err.Error()
+				}
 			} else {
 				log.Printf("filter_dialog: gmail filter created account=%s sender=%s", state.Account, f.Sender)
 				resultText += "\n\nAlso created in Gmail ✓"
