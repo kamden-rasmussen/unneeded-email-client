@@ -723,7 +723,6 @@ func markedDoneProps(mm *notify.Mattermost, postID string, number int, label str
 			} else {
 				atts[i].Text = "**" + label + " ✓**"
 			}
-			atts[i].Actions = nil
 			break
 		}
 	}
@@ -747,7 +746,6 @@ func updatePostDone(mm *notify.Mattermost, postID string, number int, label stri
 			} else {
 				atts[i].Text = "**" + label + " ✓**"
 			}
-			atts[i].Actions = nil
 			break
 		}
 	}
