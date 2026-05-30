@@ -185,7 +185,20 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("marked read %s", ctx.EmailID)
 		mm := h.getMMForUser(ctx.User)
-		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Read", "")
+		n := strconv.Itoa(ctx.Number)
+		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Read", func(att *notify.Attachment) {
+			att.Color = ""
+			for i, a := range att.Actions {
+				if a.ID == "rd"+n {
+					att.Actions[i].ID = "ur" + n
+					att.Actions[i].Name = "Mark Unread"
+					if att.Actions[i].Integration != nil {
+						att.Actions[i].Integration.Context["action"] = "mark_unread"
+					}
+					break
+				}
+			}
+		})
 		resp := buttonResponse{EphemeralText: "Marked Read ✓"}
 		if props != nil {
 			resp.Update = &buttonUpdate{Props: props}
@@ -200,7 +213,20 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("marked unread %s", ctx.EmailID)
 		mm := h.getMMForUser(ctx.User)
-		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Unread", "#1976D2")
+		n := strconv.Itoa(ctx.Number)
+		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Unread", func(att *notify.Attachment) {
+			att.Color = "#1976D2"
+			for i, a := range att.Actions {
+				if a.ID == "ur"+n {
+					att.Actions[i].ID = "rd" + n
+					att.Actions[i].Name = "Mark Read"
+					if att.Actions[i].Integration != nil {
+						att.Actions[i].Integration.Context["action"] = "mark_read"
+					}
+					break
+				}
+			}
+		})
 		resp := buttonResponse{EphemeralText: "Marked Unread ✓"}
 		if props != nil {
 			resp.Update = &buttonUpdate{Props: props}
@@ -800,8 +826,9 @@ func (h *Handler) applyFilterToExisting(user string, f config.Filter) int {
 // markedDoneProps returns updated props for a button response "update".
 // Uses the cached attachment data so other buttons retain their integration contexts
 // (Mattermost strips integration.context from GetPost responses).
-// Pass an optional colorOverride to change the card's left-border color (pass "" to clear it).
-func markedDoneProps(mm *notify.Mattermost, postID string, number int, label string, colorOverride ...string) (map[string]any, error) {
+// Pass an optional mutate func to apply additional changes to the matched attachment
+// (e.g. change border color, swap a button label/action).
+func markedDoneProps(mm *notify.Mattermost, postID string, number int, label string, mutate ...func(*notify.Attachment)) (map[string]any, error) {
 	_, atts, ok := mm.GetDigestPost(postID)
 	if !ok {
 		return nil, fmt.Errorf("post %s not in digest cache", postID)
@@ -814,8 +841,8 @@ func markedDoneProps(mm *notify.Mattermost, postID string, number int, label str
 			} else {
 				atts[i].Text = "**" + label + " ✓**"
 			}
-			if len(colorOverride) > 0 {
-				atts[i].Color = colorOverride[0]
+			if len(mutate) > 0 {
+				mutate[0](&atts[i])
 			}
 			break
 		}
