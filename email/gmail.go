@@ -28,7 +28,7 @@ func gmailOAuthConfig() (*oauth2.Config, error) {
 	return &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		Scopes:       []string{gmail.GmailModifyScope},
+		Scopes:       []string{gmail.GmailModifyScope, "https://www.googleapis.com/auth/gmail.settings.basic"},
 		Endpoint:     google.Endpoint,
 	}, nil
 }
@@ -101,6 +101,13 @@ func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {
 				MsgID:   m.Id,
 				Account: g.cfg.Name,
 				Preview: msg.Snippet,
+			}
+
+			for _, labelID := range msg.LabelIds {
+				if labelID == "UNREAD" {
+					e.Unread = true
+					break
+				}
 			}
 
 			for _, h := range msg.Payload.Headers {
@@ -191,6 +198,12 @@ func (g *GmailClient) FetchFrom(offset, limit int) ([]Email, error) {
 			MsgID:   id,
 			Account: g.cfg.Name,
 			Preview: msg.Snippet,
+		}
+		for _, labelID := range msg.LabelIds {
+			if labelID == "UNREAD" {
+				e.Unread = true
+				break
+			}
 		}
 		for _, h := range msg.Payload.Headers {
 			switch strings.ToLower(h.Name) {
@@ -313,6 +326,30 @@ func (g *GmailClient) Delete(msgID string) error {
 func (g *GmailClient) MarkRead(msgID string) error {
 	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
 		RemoveLabelIds: []string{"UNREAD"},
+	}).Do()
+	return err
+}
+
+func (g *GmailClient) MarkUnread(msgID string) error {
+	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
+		AddLabelIds: []string{"UNREAD"},
+	}).Do()
+	return err
+}
+
+// CreateSenderFilter creates a Gmail server-side filter rule for a sender pattern.
+// Bare domains (e.g. "amazon.com") are prefixed with "@" so Gmail matches all senders
+// from that domain. Full addresses (e.g. "notify@amazon.com") are used as-is.
+func (g *GmailClient) CreateSenderFilter(from string, addLabels, removeLabels []string) error {
+	if !strings.Contains(from, "@") {
+		from = "@" + from
+	}
+	_, err := g.svc.Users.Settings.Filters.Create("me", &gmail.Filter{
+		Criteria: &gmail.FilterCriteria{From: from},
+		Action: &gmail.FilterAction{
+			AddLabelIds:    addLabels,
+			RemoveLabelIds: removeLabels,
+		},
 	}).Do()
 	return err
 }

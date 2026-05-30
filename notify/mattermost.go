@@ -202,6 +202,7 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 		"account":        e.Account,
 		"email_id":       e.ID,
 		"number":         e.Number,
+		"from_addr":      e.FromAddr,
 		"sender_domain":  email.SenderDomain(e.FromAddr),
 		"webhook_secret": webhookSecret,
 	}
@@ -216,8 +217,11 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 	}
 
 	var color string
-	if e.VIP {
+	switch {
+	case e.VIP:
 		color = "#FFD700"
+	case e.Unread:
+		color = "#1976D2"
 	}
 
 	title := fmt.Sprintf("[%d/%d] %s — %s", e.Number, sessionTotal, e.Subject, e.From)
@@ -241,6 +245,17 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 		})
 	}
 
+	readToggle := Action{Type: "button"}
+	if e.Unread {
+		readToggle.ID = "rd" + n
+		readToggle.Name = "Mark Read"
+		readToggle.Integration = &Integration{URL: actionURL, Context: mkCtx("mark_read")}
+	} else {
+		readToggle.ID = "ur" + n
+		readToggle.Name = "Mark Unread"
+		readToggle.Integration = &Integration{URL: actionURL, Context: mkCtx("mark_unread")}
+	}
+
 	acts = append(acts,
 		Action{
 			ID:          "ar" + n,
@@ -248,12 +263,7 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 			Type:        "button",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("archive")},
 		},
-		Action{
-			ID:          "rd" + n,
-			Name:        "Mark Read",
-			Type:        "button",
-			Integration: &Integration{URL: actionURL, Context: mkCtx("mark_read")},
-		},
+		readToggle,
 		Action{
 			ID:          "mo" + n,
 			Name:        "Move...",
@@ -266,6 +276,12 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 			Type:        "button",
 			Style:       "danger",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("delete")},
+		},
+		Action{
+			ID:          "cf" + n,
+			Name:        "Create Filter...",
+			Type:        "button",
+			Integration: &Integration{URL: actionURL, Context: mkCtx("open_filter_dialog")},
 		},
 	)
 
@@ -375,7 +391,7 @@ func (m *Mattermost) PatchPost(postID, message string, attachments []Attachment)
 }
 
 // OpenDialog opens a Mattermost interactive dialog triggered by a button click.
-func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state string, elements []DialogElement) error {
+func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state, submitLabel string, elements []DialogElement) error {
 	body := map[string]any{
 		"trigger_id": triggerID,
 		"url":        submitURL,
@@ -383,7 +399,7 @@ func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state s
 			"callback_id":  callbackID,
 			"title":        title,
 			"state":        state,
-			"submit_label": "Move",
+			"submit_label": submitLabel,
 			"elements":     elements,
 		},
 	}

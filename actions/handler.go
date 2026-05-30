@@ -35,15 +35,11 @@ type Handler struct {
 	RenameAccount func(oldName, newName string) error
 	// NextChunk is called when a user clicks "load next chunk"; it fetches and
 	// posts the next page of emails for the given account starting at offset.
-	NextChunk     func(user, account string, offset int) error
-	pendingOAuths  sync.Map // state string → *pendingOAuth
-	pendingFilters sync.Map // token string → pendingFilter
-}
-
-type pendingFilter struct {
-	Filter    config.Filter
-	ExpiresAt time.Time
-	Confirm   func() error
+	NextChunk func(user, account string, offset int) error
+	// TriggerReauth, when set, initiates OAuth re-authorization for an account
+	// and sends the auth link via Mattermost.
+	TriggerReauth func(accountName string)
+	pendingOAuths sync.Map // state string → *pendingOAuth
 }
 
 // getMMForUser returns the Mattermost client for the given user, falling back to MMClient.
@@ -60,6 +56,8 @@ func (h *Handler) getMMForUser(user string) *notify.Mattermost {
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/actions/email", h.handleEmailAction)
 	mux.HandleFunc("/actions/move_dialog", h.handleMoveDialog)
+	mux.HandleFunc("/actions/filter_dialog", h.handleFilterDialog)
+	mux.HandleFunc("/actions/delete_confirm", h.handleDeleteConfirmDialog)
 	mux.HandleFunc("/setup/gmail/callback", h.handleGmailCallback)
 	mux.HandleFunc("/setup/imap/start", h.handleIMAPStart)
 	mux.HandleFunc("/setup/imap/callback", h.handleIMAPCallback)
@@ -106,6 +104,7 @@ type actionContext struct {
 	Offset        int    `json:"offset,omitempty"`
 	LabelID       string `json:"label_id,omitempty"`
 	LabelName     string `json:"label_name,omitempty"`
+	FromAddr      string `json:"from_addr,omitempty"`
 	SenderDomain  string `json:"sender_domain,omitempty"`
 	FilterToken   string `json:"filter_token,omitempty"`
 	WebhookSecret string `json:"webhook_secret,omitempty"`
@@ -142,10 +141,21 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := p.Context
-	client, ok := h.Clients[ctx.Account]
-	if !ok {
-		respondButton(w, buttonResponse{EphemeralText: "unknown account: " + ctx.Account})
-		return
+
+	// Actions that operate on a specific email require a valid account client.
+	// Filter approval/cancel and dialog-open actions do not.
+	requiresClient := map[string]bool{
+		"archive": true, "mark_read": true, "mark_unread": true,
+		"move": true, "move_direct": true,
+	}
+	var client email.Actioner
+	if requiresClient[ctx.Action] {
+		var ok bool
+		client, ok = h.Clients[ctx.Account]
+		if !ok {
+			respondButton(w, buttonResponse{EphemeralText: "unknown account: " + ctx.Account})
+			return
+		}
 	}
 
 	switch ctx.Action {
@@ -175,8 +185,49 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("marked read %s", ctx.EmailID)
 		mm := h.getMMForUser(ctx.User)
-		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Read")
+		n := strconv.Itoa(ctx.Number)
+		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Read", func(att *notify.Attachment) {
+			att.Color = ""
+			for i, a := range att.Actions {
+				if a.ID == "rd"+n {
+					att.Actions[i].ID = "ur" + n
+					att.Actions[i].Name = "Mark Unread"
+					if att.Actions[i].Integration != nil {
+						att.Actions[i].Integration.Context["action"] = "mark_unread"
+					}
+					break
+				}
+			}
+		})
 		resp := buttonResponse{EphemeralText: "Marked Read ✓"}
+		if props != nil {
+			resp.Update = &buttonUpdate{Props: props}
+		}
+		respondButton(w, resp)
+
+	case "mark_unread":
+		if err := client.MarkUnread(ctx.MsgID); err != nil {
+			log.Printf("mark_unread %s: %v", ctx.EmailID, err)
+			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
+			return
+		}
+		log.Printf("marked unread %s", ctx.EmailID)
+		mm := h.getMMForUser(ctx.User)
+		n := strconv.Itoa(ctx.Number)
+		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Unread", func(att *notify.Attachment) {
+			att.Color = "#1976D2"
+			for i, a := range att.Actions {
+				if a.ID == "ur"+n {
+					att.Actions[i].ID = "rd" + n
+					att.Actions[i].Name = "Mark Read"
+					if att.Actions[i].Integration != nil {
+						att.Actions[i].Integration.Context["action"] = "mark_read"
+					}
+					break
+				}
+			}
+		})
+		resp := buttonResponse{EphemeralText: "Marked Unread ✓"}
 		if props != nil {
 			resp.Update = &buttonUpdate{Props: props}
 		}
@@ -203,19 +254,29 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		respondButton(w, resp)
 
 	case "delete":
-		if err := client.Delete(ctx.MsgID); err != nil {
-			log.Printf("delete %s: %v", ctx.EmailID, err)
-			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
+		stateJSON, _ := json.Marshal(deleteConfirmState{
+			PostID:        p.PostID,
+			MsgID:         ctx.MsgID,
+			Account:       ctx.Account,
+			EmailID:       ctx.EmailID,
+			Number:        ctx.Number,
+			User:          ctx.User,
+			WebhookSecret: h.WebhookSecret,
+		})
+		if err := h.getMMForUser(ctx.User).OpenDialog(
+			p.TriggerID,
+			h.CallbackURL+"/actions/delete_confirm",
+			"confirm_delete",
+			"Confirm Delete",
+			string(stateJSON),
+			"Delete",
+			nil,
+		); err != nil {
+			log.Printf("open delete confirm dialog: %v", err)
+			respondButton(w, buttonResponse{EphemeralText: "Could not open confirmation: " + err.Error()})
 			return
 		}
-		log.Printf("deleted %s", ctx.EmailID)
-		mm := h.getMMForUser(ctx.User)
-		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Deleted")
-		resp := buttonResponse{EphemeralText: "Deleted ✓"}
-		if props != nil {
-			resp.Update = &buttonUpdate{Props: props}
-		}
-		respondButton(w, resp)
+		respondButton(w, buttonResponse{})
 
 	case "move":
 		labels, err := client.ListLabels()
@@ -250,6 +311,7 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			"move_email",
 			"Move to Folder",
 			string(stateJSON),
+			"Move",
 			[]notify.DialogElement{{
 				DisplayName: "Folder",
 				Name:        "label_id",
@@ -278,51 +340,89 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 
-	case "approve_filter", "approve_filter_apply":
-		val, ok := h.pendingFilters.LoadAndDelete(ctx.FilterToken)
-		if !ok {
-			respondButton(w, buttonResponse{EphemeralText: "This filter approval has expired or was already handled."})
-			return
+	case "open_filter_dialog":
+		domain := ctx.SenderDomain
+		if domain == "" {
+			domain = ctx.FromAddr
 		}
-		pf := val.(pendingFilter)
-		if time.Now().After(pf.ExpiresAt) {
-			respondButton(w, buttonResponse{EphemeralText: "This filter approval has expired."})
-			return
-		}
-		if err := pf.Confirm(); err != nil {
-			log.Printf("confirm filter: %v", err)
-			respondButton(w, buttonResponse{EphemeralText: "Error saving filter: " + err.Error()})
-			return
-		}
-		resultText := "Filter saved ✓\n\n" + filterDescription(pf.Filter)
-		if ctx.Action == "approve_filter_apply" {
-			n := h.applyFilterToExisting(ctx.User, pf.Filter)
-			if n > 0 {
-				resultText += fmt.Sprintf("\n\nApplied to %d existing email(s).", n)
-			} else {
-				resultText += "\n\nNo matching emails found in current digest."
-			}
-		}
-		respondButton(w, buttonResponse{
-			EphemeralText: "Filter saved ✓",
-			Update: &buttonUpdate{Props: map[string]any{
-				"attachments": []notify.Attachment{{Text: resultText, Color: "#36a64f"}},
-			}},
+		stateJSON, _ := json.Marshal(filterDialogState{
+			User:          ctx.User,
+			Account:       ctx.Account,
+			FromAddr:      ctx.FromAddr,
+			SenderDomain:  ctx.SenderDomain,
+			WebhookSecret: h.WebhookSecret,
 		})
 
-	case "cancel_filter":
-		val, ok := h.pendingFilters.LoadAndDelete(ctx.FilterToken)
-		if !ok {
-			respondButton(w, buttonResponse{EphemeralText: "Already handled."})
+		// Build label options from the account's actual labels/folders.
+		labelElem := notify.DialogElement{
+			DisplayName: "Label / Folder (for Move)",
+			Name:        "label_name",
+			Optional:    true,
+		}
+		if c, ok := h.Clients[ctx.Account]; ok {
+			if labels, err := c.ListLabels(); err == nil && len(labels) > 0 {
+				opts := make([]notify.SelectOption, len(labels))
+				for i, l := range labels {
+					opts[i] = notify.SelectOption{Text: l.Name, Value: l.Name}
+				}
+				labelElem.Type = "select"
+				labelElem.Options = opts
+			}
+		}
+		if labelElem.Type == "" {
+			labelElem.Type = "text"
+			labelElem.Placeholder = "e.g. Newsletters"
+		}
+
+		elements := []notify.DialogElement{
+			{
+				DisplayName: "Sender pattern",
+				Name:        "sender",
+				Type:        "text",
+				Default:     domain,
+				Placeholder: "e.g. amazon.com or notify@amazon.com",
+			},
+			{
+				DisplayName: "Action",
+				Name:        "action",
+				Type:        "select",
+				Default:     "archive",
+				Options: []notify.SelectOption{
+					{Text: "Archive", Value: "archive"},
+					{Text: "Delete", Value: "delete"},
+					{Text: "Skip inbox (mute)", Value: "mute"},
+					{Text: "Move to label / folder", Value: "move"},
+					{Text: "Mark as read only", Value: "mark_read"},
+				},
+			},
+			{
+				DisplayName: "Also mark as read",
+				Name:        "also_mark_read",
+				Type:        "bool",
+				Optional:    true,
+			},
+			labelElem,
+			{
+				DisplayName: "Apply to emails already in digest",
+				Name:        "also_apply",
+				Type:        "bool",
+				Optional:    true,
+			},
+		}
+		if err := h.getMMForUser(ctx.User).OpenDialog(
+			p.TriggerID,
+			h.CallbackURL+"/actions/filter_dialog",
+			"create_filter",
+			"Create Filter",
+			string(stateJSON),
+			"Create Filter",
+			elements,
+		); err != nil {
+			log.Printf("open filter dialog: %v", err)
+			respondButton(w, buttonResponse{EphemeralText: "Could not open filter dialog: " + err.Error()})
 			return
 		}
-		pf := val.(pendingFilter)
-		respondButton(w, buttonResponse{
-			EphemeralText: "Filter cancelled.",
-			Update: &buttonUpdate{Props: map[string]any{
-				"attachments": []notify.Attachment{{Text: "~~" + filterDescription(pf.Filter) + "~~ _(cancelled)_"}},
-			}},
-		})
+		respondButton(w, buttonResponse{})
 
 	default:
 		respondButton(w, buttonResponse{EphemeralText: "unknown action: " + ctx.Action})
@@ -330,6 +430,14 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- move dialog submission ---
+
+type filterDialogState struct {
+	User          string `json:"user"`
+	Account       string `json:"account"`
+	FromAddr      string `json:"from_addr"`
+	SenderDomain  string `json:"sender_domain"`
+	WebhookSecret string `json:"webhook_secret"`
+}
 
 type moveState struct {
 	PostID        string `json:"post_id"`
@@ -342,11 +450,32 @@ type moveState struct {
 	WebhookSecret string `json:"webhook_secret,omitempty"`
 }
 
+type deleteConfirmState struct {
+	PostID        string `json:"post_id"`
+	MsgID         string `json:"msg_id"`
+	Account       string `json:"account"`
+	EmailID       string `json:"email_id"`
+	Number        int    `json:"number"`
+	User          string `json:"user,omitempty"`
+	WebhookSecret string `json:"webhook_secret,omitempty"`
+}
+
 type dialogSubmission struct {
-	CallbackID string            `json:"callback_id"`
-	State      string            `json:"state"`
-	Submission map[string]string `json:"submission"`
-	Cancelled  bool              `json:"cancelled"`
+	CallbackID string         `json:"callback_id"`
+	TriggerID  string         `json:"trigger_id"`
+	State      string         `json:"state"`
+	Submission map[string]any `json:"submission"`
+	Cancelled  bool           `json:"cancelled"`
+}
+
+func subStr(sub map[string]any, key string) string {
+	v, _ := sub[key].(string)
+	return v
+}
+
+func subBool(sub map[string]any, key string) bool {
+	v, _ := sub[key].(bool)
+	return v
 }
 
 func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
@@ -373,7 +502,7 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	labelID := sub.Submission["label_id"]
+	labelID := subStr(sub.Submission, "label_id")
 	if labelID == "" {
 		respondDialogError(w, "no folder selected")
 		return
@@ -422,63 +551,209 @@ func (h *Handler) handleMoveDialog(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "{}")
 }
 
-// --- filter approval ---
+// --- delete confirmation dialog ---
 
-// ProposeFilter sends a draft filter card to the user with Approve / Approve+Apply / Cancel buttons.
-func (h *Handler) ProposeFilter(user string, f config.Filter, mm *notify.Mattermost, confirm func() error) error {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return err
+func (h *Handler) handleDeleteConfirmDialog(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var sub dialogSubmission
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
-	token := hex.EncodeToString(b)
 
-	h.pendingFilters.Store(token, pendingFilter{
-		Filter:    f,
-		ExpiresAt: time.Now().Add(10 * time.Minute),
-		Confirm:   confirm,
-	})
-
-	base := map[string]any{
-		"user":           user,
-		"filter_token":   token,
-		"webhook_secret": h.WebhookSecret,
+	var state deleteConfirmState
+	if err := json.Unmarshal([]byte(sub.State), &state); err != nil {
+		respondDialogError(w, "invalid state")
+		return
 	}
-	mkCtx := func(action string) map[string]any {
-		ctx := make(map[string]any, len(base)+1)
-		for k, v := range base {
-			ctx[k] = v
+
+	if !h.validSecret(state.WebhookSecret) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if sub.Cancelled {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	client, ok := h.Clients[state.Account]
+	if !ok {
+		respondDialogError(w, "unknown account: "+state.Account)
+		return
+	}
+
+	if err := client.Delete(state.MsgID); err != nil {
+		log.Printf("delete %s: %v", state.EmailID, err)
+		respondDialogError(w, "Error deleting email: "+err.Error())
+		return
+	}
+
+	log.Printf("deleted %s", state.EmailID)
+
+	if state.PostID != "" {
+		mm := h.getMMForUser(state.User)
+		if err := updatePostDone(mm, state.PostID, state.Number, "Deleted"); err != nil {
+			log.Printf("update post %s: %v", state.PostID, err)
 		}
-		ctx["action"] = action
-		return ctx
 	}
 
-	att := notify.Attachment{
-		Text: "Add this filter?\n\n" + filterDescription(f),
-		Actions: []notify.Action{
-			{
-				ID:    "fa" + token[:6],
-				Name:  "Approve",
-				Type:  "button",
-				Style: "success",
-				Integration: &notify.Integration{URL: h.CallbackURL + "/actions/email", Context: mkCtx("approve_filter")},
-			},
-			{
-				ID:    "faa" + token[:6],
-				Name:  "Approve + Apply to existing",
-				Type:  "button",
-				Style: "primary",
-				Integration: &notify.Integration{URL: h.CallbackURL + "/actions/email", Context: mkCtx("approve_filter_apply")},
-			},
-			{
-				ID:    "fc" + token[:6],
-				Name:  "Cancel",
-				Type:  "button",
-				Style: "danger",
-				Integration: &notify.Integration{URL: h.CallbackURL + "/actions/email", Context: mkCtx("cancel_filter")},
-			},
-		},
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, "{}")
+}
+
+// --- filter dialog submission ---
+
+func (h *Handler) handleFilterDialog(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var sub dialogSubmission
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		log.Printf("filter_dialog: decode body: %v", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
-	return mm.PostAttachment("", att)
+
+	log.Printf("filter_dialog: callback_id=%q state_len=%d submission=%v cancelled=%v", sub.CallbackID, len(sub.State), sub.Submission, sub.Cancelled)
+
+	var state filterDialogState
+	if err := json.Unmarshal([]byte(sub.State), &state); err != nil {
+		log.Printf("filter_dialog: unmarshal state %q: %v", sub.State, err)
+		respondDialogError(w, "invalid request state")
+		return
+	}
+
+	if !h.validSecret(state.WebhookSecret) {
+		log.Printf("filter_dialog: invalid webhook secret")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if sub.Cancelled {
+		log.Printf("filter_dialog: cancelled by user")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	sender := strings.TrimSpace(subStr(sub.Submission, "sender"))
+	if sender == "" {
+		respondDialogError(w, "sender pattern is required")
+		return
+	}
+
+	action := subStr(sub.Submission, "action")
+	labelName := strings.TrimSpace(subStr(sub.Submission, "label_name"))
+	alsoMarkRead := subBool(sub.Submission, "also_mark_read")
+	log.Printf("filter_dialog: sender=%q action=%q label=%q also_read=%v", sender, action, labelName, alsoMarkRead)
+
+	var filterActions []string
+	switch action {
+	case "archive":
+		filterActions = append(filterActions, "archive")
+	case "delete":
+		filterActions = append(filterActions, "delete")
+	case "mute":
+		filterActions = append(filterActions, "mute")
+	case "move":
+		if labelName == "" {
+			respondDialogError(w, "label name is required for Move to label")
+			return
+		}
+		filterActions = append(filterActions, "move")
+	case "mark_read":
+		filterActions = append(filterActions, "mark_read")
+	default:
+		log.Printf("filter_dialog: unknown action %q", action)
+		respondDialogError(w, "select an action")
+		return
+	}
+
+	if alsoMarkRead && action != "mark_read" && action != "delete" {
+		filterActions = append(filterActions, "mark_read")
+	}
+
+	f := config.Filter{
+		Sender:    sender,
+		Actions:   filterActions,
+		LabelName: labelName,
+	}
+
+	resultText := "Filter created ✓\n\n" + filterDescription(f)
+
+	if state.Account != "" {
+		if creator, ok := h.Clients[state.Account].(email.FilterCreator); ok {
+			add, remove := gmailFilterLabels(f, h.Clients[state.Account])
+			if err := creator.CreateSenderFilter(f.Sender, add, remove); err != nil {
+				log.Printf("filter_dialog: gmail filter account=%s: %v", state.Account, err)
+				if strings.Contains(err.Error(), "insufficientPermissions") || strings.Contains(err.Error(), "ACCESS_TOKEN_SCOPE_INSUFFICIENT") {
+					resultText += "\n\n⚠️ Gmail needs re-authorization for filter management — sending auth link now."
+					if h.TriggerReauth != nil {
+						h.TriggerReauth(state.Account)
+					}
+				} else {
+					resultText += "\n\n⚠️ Could not create in Gmail: " + err.Error()
+				}
+			} else {
+				log.Printf("filter_dialog: gmail filter created account=%s sender=%s", state.Account, f.Sender)
+				resultText += "\n\nAlso created in Gmail ✓"
+			}
+		}
+	}
+
+	if alsoApply := subBool(sub.Submission, "also_apply"); alsoApply {
+		n := h.applyFilterToExisting(state.User, f)
+		if n > 0 {
+			resultText += fmt.Sprintf("\n\nApplied to %d existing email(s) ✓", n)
+		} else {
+			resultText += "\n\nNo matching emails in current digest."
+		}
+	}
+
+	mm := h.getMMForUser(state.User)
+	if err := mm.PostAttachment("", notify.Attachment{Text: resultText, Color: "#36a64f"}); err != nil {
+		log.Printf("filter_dialog: post result: %v", err)
+	}
+
+	log.Printf("filter_dialog: done user=%q sender=%q actions=%v", state.User, sender, filterActions)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, "{}")
+}
+
+// gmailFilterLabels converts our filter actions to Gmail label IDs for a server-side filter.
+func gmailFilterLabels(f config.Filter, client email.Actioner) (addLabels, removeLabels []string) {
+	seen := make(map[string]bool)
+	add := func(s string, dst *[]string) {
+		if !seen[s] {
+			seen[s] = true
+			*dst = append(*dst, s)
+		}
+	}
+	for _, act := range f.Actions {
+		switch act {
+		case "archive":
+			add("INBOX", &removeLabels)
+		case "mark_read":
+			add("UNREAD", &removeLabels)
+		case "delete":
+			add("TRASH", &addLabels)
+			add("INBOX", &removeLabels)
+		case "mute":
+			add("INBOX", &removeLabels)
+		case "move":
+			if f.LabelName == "" {
+				break
+			}
+			add("INBOX", &removeLabels)
+			if labels, err := client.ListLabels(); err == nil {
+				for _, l := range labels {
+					if strings.EqualFold(l.Name, f.LabelName) {
+						add(l.ID, &addLabels)
+						break
+					}
+				}
+			}
+		}
+	}
+	return
 }
 
 func filterDescription(f config.Filter) string {
@@ -517,6 +792,8 @@ func (h *Handler) applyFilterToExisting(user string, f config.Filter) int {
 				client.Archive(de.MsgID) //nolint:errcheck
 			case "mark_read":
 				client.MarkRead(de.MsgID) //nolint:errcheck
+			case "delete":
+				client.Delete(de.MsgID) //nolint:errcheck
 			case "mute":
 				// no-op: email is already in the digest
 			case "move":
@@ -546,7 +823,12 @@ func (h *Handler) applyFilterToExisting(user string, f config.Filter) int {
 // markedDoneProps returns updated props for a button response "update".
 // Uses the cached attachment data so other buttons retain their integration contexts
 // (Mattermost strips integration.context from GetPost responses).
-func markedDoneProps(mm *notify.Mattermost, postID string, number int, label string) (map[string]any, error) {
+// markedDoneProps returns updated props for a button response "update".
+// Uses the cached attachment data so other buttons retain their integration contexts
+// (Mattermost strips integration.context from GetPost responses).
+// Pass an optional mutate func to apply additional changes to the matched attachment
+// (e.g. change border color, swap a button label/action).
+func markedDoneProps(mm *notify.Mattermost, postID string, number int, label string, mutate ...func(*notify.Attachment)) (map[string]any, error) {
 	_, atts, ok := mm.GetDigestPost(postID)
 	if !ok {
 		return nil, fmt.Errorf("post %s not in digest cache", postID)
@@ -559,7 +841,9 @@ func markedDoneProps(mm *notify.Mattermost, postID string, number int, label str
 			} else {
 				atts[i].Text = "**" + label + " ✓**"
 			}
-			atts[i].Actions = nil
+			if len(mutate) > 0 {
+				mutate[0](&atts[i])
+			}
 			break
 		}
 	}
@@ -583,7 +867,6 @@ func updatePostDone(mm *notify.Mattermost, postID string, number int, label stri
 			} else {
 				atts[i].Text = "**" + label + " ✓**"
 			}
-			atts[i].Actions = nil
 			break
 		}
 	}
