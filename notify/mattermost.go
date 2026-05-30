@@ -245,6 +245,17 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 		})
 	}
 
+	readToggle := Action{Type: "button"}
+	if e.Unread {
+		readToggle.ID = "rd" + n
+		readToggle.Name = "Mark Read"
+		readToggle.Integration = &Integration{URL: actionURL, Context: mkCtx("mark_read")}
+	} else {
+		readToggle.ID = "ur" + n
+		readToggle.Name = "Mark Unread"
+		readToggle.Integration = &Integration{URL: actionURL, Context: mkCtx("mark_unread")}
+	}
+
 	acts = append(acts,
 		Action{
 			ID:          "ar" + n,
@@ -252,12 +263,7 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 			Type:        "button",
 			Integration: &Integration{URL: actionURL, Context: mkCtx("archive")},
 		},
-		Action{
-			ID:          "rd" + n,
-			Name:        "Mark Read",
-			Type:        "button",
-			Integration: &Integration{URL: actionURL, Context: mkCtx("mark_read")},
-		},
+		readToggle,
 		Action{
 			ID:          "mo" + n,
 			Name:        "Move...",

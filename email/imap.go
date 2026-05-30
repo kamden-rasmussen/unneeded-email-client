@@ -136,6 +136,14 @@ func (ic *IMAPClient) Delete(msgID string) error {
 }
 
 func (ic *IMAPClient) MarkRead(msgID string) error {
+	return ic.setSeenFlag(msgID, true)
+}
+
+func (ic *IMAPClient) MarkUnread(msgID string) error {
+	return ic.setSeenFlag(msgID, false)
+}
+
+func (ic *IMAPClient) setSeenFlag(msgID string, seen bool) error {
 	if err := ic.reconnect(); err != nil {
 		return err
 	}
@@ -148,7 +156,11 @@ func (ic *IMAPClient) MarkRead(msgID string) error {
 	}
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(uint32(uid))
-	return ic.c.UidStore(seqset, imap.FormatFlagsOp(imap.AddFlags, true), []interface{}{imap.SeenFlag}, nil)
+	var op imap.FlagsOp = imap.AddFlags
+	if !seen {
+		op = imap.RemoveFlags
+	}
+	return ic.c.UidStore(seqset, imap.FormatFlagsOp(op, true), []interface{}{imap.SeenFlag}, nil)
 }
 
 func (ic *IMAPClient) MoveToLabel(msgID, mailbox string) error {

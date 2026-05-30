@@ -330,6 +330,13 @@ func (g *GmailClient) MarkRead(msgID string) error {
 	return err
 }
 
+func (g *GmailClient) MarkUnread(msgID string) error {
+	_, err := g.svc.Users.Messages.Modify("me", msgID, &gmail.ModifyMessageRequest{
+		AddLabelIds: []string{"UNREAD"},
+	}).Do()
+	return err
+}
+
 // CreateSenderFilter creates a Gmail server-side filter rule for a sender pattern.
 // Bare domains (e.g. "amazon.com") are prefixed with "@" so Gmail matches all senders
 // from that domain. Full addresses (e.g. "notify@amazon.com") are used as-is.
