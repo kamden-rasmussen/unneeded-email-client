@@ -77,7 +77,7 @@ func (ic *IMAPClient) FetchNew(since time.Time) ([]Email, error) {
 	ch := make(chan *imap.Message, 32)
 	done := make(chan error, 1)
 	go func() {
-		done <- ic.c.UidFetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}, ch)
+		done <- ic.c.UidFetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid, imap.FetchFlags}, ch)
 	}()
 
 	var emails []Email
@@ -92,6 +92,13 @@ func (ic *IMAPClient) FetchNew(since time.Time) ([]Email, error) {
 			Account: ic.cfg.Name,
 			Date:    msg.Envelope.Date,
 			Subject: msg.Envelope.Subject,
+			Unread:  true,
+		}
+		for _, flag := range msg.Flags {
+			if flag == imap.SeenFlag {
+				e.Unread = false
+				break
+			}
 		}
 		if len(msg.Envelope.From) > 0 {
 			from := msg.Envelope.From[0]
@@ -129,6 +136,14 @@ func (ic *IMAPClient) Delete(msgID string) error {
 }
 
 func (ic *IMAPClient) MarkRead(msgID string) error {
+	return ic.setSeenFlag(msgID, true)
+}
+
+func (ic *IMAPClient) MarkUnread(msgID string) error {
+	return ic.setSeenFlag(msgID, false)
+}
+
+func (ic *IMAPClient) setSeenFlag(msgID string, seen bool) error {
 	if err := ic.reconnect(); err != nil {
 		return err
 	}
@@ -141,7 +156,11 @@ func (ic *IMAPClient) MarkRead(msgID string) error {
 	}
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(uint32(uid))
-	return ic.c.UidStore(seqset, imap.FormatFlagsOp(imap.AddFlags, true), []interface{}{imap.SeenFlag}, nil)
+	var op imap.FlagsOp = imap.AddFlags
+	if !seen {
+		op = imap.RemoveFlags
+	}
+	return ic.c.UidStore(seqset, imap.FormatFlagsOp(op, true), []interface{}{imap.SeenFlag}, nil)
 }
 
 func (ic *IMAPClient) MoveToLabel(msgID, mailbox string) error {

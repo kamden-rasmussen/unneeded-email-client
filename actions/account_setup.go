@@ -177,6 +177,7 @@ func (h *Handler) handleIMAPStart(w http.ResponseWriter, r *http.Request) {
 		"imap_setup",
 		title,
 		string(stateJSON),
+		"Next",
 		elements,
 	); err != nil {
 		log.Printf("open imap dialog: %v", err)
@@ -210,10 +211,10 @@ func (h *Handler) handleIMAPCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	emailAddr := sub.Submission["email"]
-	password := sub.Submission["password"]
-	host := sub.Submission["host"]
-	portStr := sub.Submission["port"]
+	emailAddr := subStr(sub.Submission, "email")
+	password := subStr(sub.Submission, "password")
+	host := subStr(sub.Submission, "host")
+	portStr := subStr(sub.Submission, "port")
 
 	if emailAddr == "" || password == "" || host == "" {
 		respondDialogError(w, "Email, password, and host are required.")
