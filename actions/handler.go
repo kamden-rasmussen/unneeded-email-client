@@ -340,6 +340,73 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 
+	case "read_full":
+		c, ok := h.Clients[ctx.Account]
+		if !ok {
+			respondButton(w, buttonResponse{EphemeralText: "unknown account: " + ctx.Account})
+			return
+		}
+		fetcher, ok := c.(email.BodyFetcher)
+		if !ok {
+			respondButton(w, buttonResponse{EphemeralText: "Full email view is not supported for this account."})
+			return
+		}
+		// Respond immediately; fetching and posting happens async to avoid the 3-second button timeout.
+		respondButton(w, buttonResponse{EphemeralText: "Loading full email…"})
+		postID := p.PostID
+		number := ctx.Number
+		emailID := ctx.EmailID
+		msgID := ctx.MsgID
+		n := strconv.Itoa(ctx.Number)
+		ctxCopy := ctx
+		callbackURL := h.CallbackURL
+		webhookSecret := h.WebhookSecret
+		mm := h.getMMForUser(ctx.User)
+		go func() {
+			body, err := fetcher.FetchBody(msgID)
+			if err != nil {
+				log.Printf("read_full: fetch body %s: %v", emailID, err)
+				mm.PostMessage("Error fetching full email: " + err.Error()) //nolint:errcheck
+				return
+			}
+			log.Printf("read_full: body len=%d for %s", len(body), emailID)
+			if body == "" {
+				body = "_(email body is empty or could not be extracted)_"
+			}
+			const maxBody = 4000
+			if len(body) > maxBody {
+				body = body[:maxBody] + "\n\n_(message truncated)_"
+			}
+			// Try to clone the attachment from the digest cache (title, color, preview).
+			// On cache miss (server restart), rebuild buttons from context data.
+			var fullAtt notify.Attachment
+			if _, cachedAtts, ok := mm.GetDigestPost(postID); ok {
+				for _, att := range cachedAtts {
+					if attachmentOwnsNumber(att, number) {
+						fullAtt = att
+						break
+					}
+				}
+			}
+			// Remove the "Read Full Email" button to avoid nesting.
+			var filtered []notify.Action
+			for _, a := range fullAtt.Actions {
+				if a.ID != "rf"+n {
+					filtered = append(filtered, a)
+				}
+			}
+			// Rebuild buttons from context if the cache was empty.
+			if len(filtered) == 0 {
+				filtered = buildEmailActionsFromCtx(ctxCopy, n, callbackURL, webhookSecret)
+			}
+			fullAtt.Actions = filtered
+			fullAtt.Text = body
+			if _, err := mm.PostFullEmail("", fullAtt); err != nil {
+				log.Printf("read_full: post %s: %v", emailID, err)
+				mm.PostMessage("Error posting full email.") //nolint:errcheck
+			}
+		}()
+
 	case "open_filter_dialog":
 		domain := ctx.SenderDomain
 		if domain == "" {
@@ -885,6 +952,38 @@ func attachmentOwnsNumber(att notify.Attachment, number int) bool {
 		}
 	}
 	return false
+}
+
+// buildEmailActionsFromCtx reconstructs the standard set of email action buttons
+// from an actionContext. Used when the in-memory digest cache is unavailable
+// (e.g. after a server restart).
+func buildEmailActionsFromCtx(ctx actionContext, n, callbackURL, webhookSecret string) []notify.Action {
+	actionURL := callbackURL + "/actions/email"
+	mkCtx := func(action string) map[string]any {
+		return map[string]any{
+			"action":         action,
+			"user":           ctx.User,
+			"msg_id":         ctx.MsgID,
+			"account":        ctx.Account,
+			"email_id":       ctx.EmailID,
+			"number":         ctx.Number,
+			"from_addr":      ctx.FromAddr,
+			"sender_domain":  ctx.SenderDomain,
+			"webhook_secret": webhookSecret,
+		}
+	}
+	return []notify.Action{
+		{ID: "ar" + n, Name: "Archive", Type: "button",
+			Integration: &notify.Integration{URL: actionURL, Context: mkCtx("archive")}},
+		{ID: "rd" + n, Name: "Mark Read", Type: "button",
+			Integration: &notify.Integration{URL: actionURL, Context: mkCtx("mark_read")}},
+		{ID: "mo" + n, Name: "Move...", Type: "button",
+			Integration: &notify.Integration{URL: actionURL, Context: mkCtx("move")}},
+		{ID: "dl" + n, Name: "Delete", Type: "button", Style: "danger",
+			Integration: &notify.Integration{URL: actionURL, Context: mkCtx("delete")}},
+		{ID: "cf" + n, Name: "Create Filter...", Type: "button",
+			Integration: &notify.Integration{URL: actionURL, Context: mkCtx("open_filter_dialog")}},
+	}
 }
 
 // validSecret returns true if no secret is configured, or if the provided value
