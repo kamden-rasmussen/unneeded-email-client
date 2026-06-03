@@ -2,6 +2,7 @@ package email
 
 import (
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -113,6 +114,36 @@ func (ic *IMAPClient) FetchNew(since time.Time) ([]Email, error) {
 	}
 
 	return emails, <-done
+}
+
+func (ic *IMAPClient) FetchBody(msgID string) (string, error) {
+	if err := ic.reconnect(); err != nil {
+		return "", err
+	}
+	if _, err := ic.c.Select("INBOX", true); err != nil {
+		return "", fmt.Errorf("select inbox: %w", err)
+	}
+	uid, err := strconv.ParseUint(msgID, 10, 32)
+	if err != nil {
+		return "", fmt.Errorf("invalid uid %q: %w", msgID, err)
+	}
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(uint32(uid))
+
+	ch := make(chan *imap.Message, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- ic.c.UidFetch(seqset, []imap.FetchItem{imap.FetchRFC822Text}, ch)
+	}()
+
+	var body string
+	for msg := range ch {
+		for _, r := range msg.Body {
+			b, _ := io.ReadAll(r)
+			body = string(b)
+		}
+	}
+	return body, <-done
 }
 
 func (ic *IMAPClient) Close() error {

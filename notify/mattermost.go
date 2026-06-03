@@ -278,6 +278,12 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 			Integration: &Integration{URL: actionURL, Context: mkCtx("delete")},
 		},
 		Action{
+			ID:          "rf" + n,
+			Name:        "Read Full Email",
+			Type:        "button",
+			Integration: &Integration{URL: actionURL, Context: mkCtx("read_full")},
+		},
+		Action{
 			ID:          "cf" + n,
 			Name:        "Create Filter...",
 			Type:        "button",
@@ -297,6 +303,12 @@ func buildEmailAttachment(e email.Email, callbackURL, webhookSecret string, sess
 	}
 
 	return att
+}
+
+// PostFullEmail posts a single attachment card and registers it in the digest cache.
+// Returns the new post ID so callers can update it later via button actions.
+func (m *Mattermost) PostFullEmail(message string, att Attachment) (string, error) {
+	return m.postWithAttachments(message, []Attachment{att})
 }
 
 // SendPromptWithButton posts a message with a single action button.
