@@ -38,3 +38,9 @@ type Counter interface {
 type Paginator interface {
 	FetchFrom(offset, limit int) ([]Email, error)
 }
+
+// BodyFetcher can retrieve the full body text of a message.
+// Both GmailClient and IMAPClient implement this.
+type BodyFetcher interface {
+	FetchBody(msgID string) (string, error)
+}

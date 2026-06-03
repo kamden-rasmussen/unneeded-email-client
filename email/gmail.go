@@ -2,6 +2,7 @@ package email
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -335,6 +336,80 @@ func (g *GmailClient) MarkUnread(msgID string) error {
 		AddLabelIds: []string{"UNREAD"},
 	}).Do()
 	return err
+}
+
+func (g *GmailClient) FetchBody(msgID string) (string, error) {
+	msg, err := g.svc.Users.Messages.Get("me", msgID).Format("full").Do()
+	if err != nil {
+		return "", err
+	}
+	return extractGmailBody(msg.Payload), nil
+}
+
+// extractGmailBody walks the MIME tree and returns the best available plain text.
+// Prefers text/plain; falls back to text/html with tags stripped.
+func extractGmailBody(part *gmail.MessagePart) string {
+	if part == nil {
+		return ""
+	}
+	// Leaf node: decode and return if it's any text type.
+	if part.Body != nil && part.Body.Data != "" {
+		data, err := base64.RawURLEncoding.DecodeString(part.Body.Data)
+		if err != nil {
+			return ""
+		}
+		if part.MimeType == "text/html" {
+			return stripHTML(string(data))
+		}
+		return string(data)
+	}
+	// Container: prefer text/plain sub-parts first.
+	for _, p := range part.Parts {
+		if p.MimeType == "text/plain" {
+			if text := extractGmailBody(p); text != "" {
+				return text
+			}
+		}
+	}
+	// Fall back to text/html sub-parts.
+	for _, p := range part.Parts {
+		if p.MimeType == "text/html" {
+			if text := extractGmailBody(p); text != "" {
+				return text
+			}
+		}
+	}
+	// Recurse into any remaining sub-parts (multipart/mixed, multipart/alternative, etc.).
+	for _, p := range part.Parts {
+		if text := extractGmailBody(p); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+// stripHTML removes HTML tags and decodes common entities for plain-text display.
+func stripHTML(s string) string {
+	var out strings.Builder
+	inTag := false
+	for _, c := range s {
+		switch {
+		case c == '<':
+			inTag = true
+		case c == '>':
+			inTag = false
+		case !inTag:
+			out.WriteRune(c)
+		}
+	}
+	r := out.String()
+	r = strings.ReplaceAll(r, "&amp;", "&")
+	r = strings.ReplaceAll(r, "&lt;", "<")
+	r = strings.ReplaceAll(r, "&gt;", ">")
+	r = strings.ReplaceAll(r, "&quot;", "\"")
+	r = strings.ReplaceAll(r, "&#39;", "'")
+	r = strings.ReplaceAll(r, "&nbsp;", " ")
+	return strings.TrimSpace(r)
 }
 
 // CreateSenderFilter creates a Gmail server-side filter rule for a sender pattern.
