@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/rand"
 	"fmt"
 	"os"
 
@@ -77,9 +78,10 @@ type DigestOpts struct {
 
 // User maps a Mattermost username to a subset of email accounts and their own preferences file.
 type User struct {
+	ID             string   `yaml:"id"`            // stable UUID; auto-generated on first run
 	MattermostUser string   `yaml:"mattermost_user"`
-	Accounts       []string `yaml:"accounts"`   // names from the top-level accounts list
-	Preferences    string   `yaml:"preferences"` // path to preferences file
+	Accounts       []string `yaml:"accounts"`      // names from the top-level accounts list
+	Preferences    string   `yaml:"preferences"`   // path to preferences file
 }
 
 func Load(path string) (*Config, error) {
@@ -229,4 +231,57 @@ func SavePreferences(path string, prefs *Preferences) error {
 	enc := yaml.NewEncoder(f)
 	enc.SetIndent(2)
 	return enc.Encode(prefs)
+}
+
+// EnsureUserIDs generates a UUID for any user missing one, updates the slice in place,
+// and persists the change back to the config file. Returns true if any IDs were generated.
+func EnsureUserIDs(path string, users []User) (bool, error) {
+	changed := false
+	for i := range users {
+		if users[i].ID == "" {
+			users[i].ID = newUUID()
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return true, fmt.Errorf("reading config: %w", err)
+	}
+	var raw Config
+	err = yaml.NewDecoder(f).Decode(&raw)
+	f.Close()
+	if err != nil {
+		return true, fmt.Errorf("parsing config: %w", err)
+	}
+
+	// Match by MattermostUser (the only stable key before IDs existed).
+	for i := range raw.Users {
+		for _, u := range users {
+			if raw.Users[i].MattermostUser == u.MattermostUser {
+				raw.Users[i].ID = u.ID
+				break
+			}
+		}
+	}
+
+	out, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		return true, fmt.Errorf("writing config: %w", err)
+	}
+	defer out.Close()
+	enc := yaml.NewEncoder(out)
+	enc.SetIndent(2)
+	return true, enc.Encode(&raw)
+}
+
+func newUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

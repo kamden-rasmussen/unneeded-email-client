@@ -65,6 +65,15 @@ func NewGmailClient(acc config.Account) (*GmailClient, error) {
 
 func (g *GmailClient) Name() string { return g.cfg.Name }
 
+// GetEmailAddress returns the Gmail address associated with this account.
+func (g *GmailClient) GetEmailAddress() (string, error) {
+	profile, err := g.svc.Users.GetProfile("me").Do()
+	if err != nil {
+		return "", err
+	}
+	return profile.EmailAddress, nil
+}
+
 const maxFetchPerAccount = 50
 
 func (g *GmailClient) FetchNew(_ time.Time) ([]Email, error) {

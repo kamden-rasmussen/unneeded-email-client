@@ -30,9 +30,10 @@ type Mattermost struct {
 }
 
 type Post struct {
-	ID      string
-	UserID  string
-	Message string
+	ID       string
+	UserID   string
+	Message  string
+	CreateAt int64 // Mattermost server timestamp in milliseconds
 }
 
 // Attachment is a Mattermost message attachment card.
@@ -97,7 +98,7 @@ func NewMattermostForUser(cfg config.Mattermost, dmUser string) *Mattermost {
 // CallbackURL is configured; otherwise falls back to a plain text message.
 // totalCounts maps account name → total inbox message count for "X of Y" header display.
 // nextOffsets maps account name → inbox offset for the "load next chunk" button; omit or nil to suppress.
-func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int, nextOffsets map[string]int) error {
+func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int, nextOffsets map[string]int, summary string) error {
 	header := fmt.Sprintf("### Email Digest — %s", time.Now().Format("Monday, January 2"))
 
 	if len(emails) == 0 {
@@ -108,7 +109,10 @@ func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int
 		return m.PostMessage(formatDigest(emails))
 	}
 
-	header += fmt.Sprintf("\n\n**%d new email(s)**  _Reply with `archive 1 2`, `read 3`, `done all` if buttons aren't working_", len(emails))
+	if summary != "" {
+		header += "\n\n" + summary
+	}
+	header += fmt.Sprintf("\n\n_**%d email(s)** — reply `archive 1 2`, `read 3`, `done all` if buttons aren't working_", len(emails))
 
 	// sessionTotal is the highest email number in this batch; used for [N/total] display.
 	sessionTotal := emails[len(emails)-1].Number
@@ -328,18 +332,20 @@ func (m *Mattermost) PostMessage(text string) error {
 	return m.createPost(text)
 }
 
-// GetNewMessages returns messages from the user (not the bot) since sinceMillis.
-func (m *Mattermost) GetNewMessages(sinceMillis int64) ([]Post, error) {
-	if err := m.resolveChannelID(); err != nil {
-		return nil, err
+// GetNewMessages returns messages from the user (not the bot) since sinceMillis,
+// along with the highest create_at timestamp seen across all posts (including bot posts).
+// Callers should use maxSeen as the next cursor to stay in Mattermost's time reference.
+func (m *Mattermost) GetNewMessages(sinceMillis int64) (posts []Post, maxSeen int64, err error) {
+	if err = m.resolveChannelID(); err != nil {
+		return nil, 0, err
 	}
-	if err := m.resolveBotID(); err != nil {
-		return nil, err
+	if err = m.resolveBotID(); err != nil {
+		return nil, 0, err
 	}
 
 	resp, err := m.apiGet(fmt.Sprintf("/channels/%s/posts?since=%d", m.channelID, sinceMillis))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
@@ -347,24 +353,27 @@ func (m *Mattermost) GetNewMessages(sinceMillis int64) ([]Post, error) {
 	var result struct {
 		Order []string `json:"order"`
 		Posts map[string]struct {
-			ID      string `json:"id"`
-			UserID  string `json:"user_id"`
-			Message string `json:"message"`
+			ID       string `json:"id"`
+			UserID   string `json:"user_id"`
+			Message  string `json:"message"`
+			CreateAt int64  `json:"create_at"`
 		} `json:"posts"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
+	if err = json.Unmarshal(body, &result); err != nil {
+		return nil, 0, err
 	}
 
-	var posts []Post
 	for _, id := range result.Order {
 		p := result.Posts[id]
+		if p.CreateAt > maxSeen {
+			maxSeen = p.CreateAt
+		}
 		if p.UserID == m.botID {
 			continue
 		}
-		posts = append(posts, Post{ID: p.ID, UserID: p.UserID, Message: p.Message})
+		posts = append(posts, Post{ID: p.ID, UserID: p.UserID, Message: p.Message, CreateAt: p.CreateAt})
 	}
-	return posts, nil
+	return posts, maxSeen, nil
 }
 
 // GetPost returns the raw post map for updating attachments.

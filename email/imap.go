@@ -3,6 +3,8 @@ package email
 import (
 	"fmt"
 	"io"
+	"net/textproto"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -223,6 +225,152 @@ func (ic *IMAPClient) ListLabels() ([]Label, error) {
 		labels = append(labels, Label{ID: m.Name, Name: m.Name})
 	}
 	return labels, <-done
+}
+
+func (ic *IMAPClient) InboxCount() (int, error) {
+	if err := ic.reconnect(); err != nil {
+		return 0, err
+	}
+	status, err := ic.c.Status("INBOX", []imap.StatusItem{imap.StatusMessages})
+	if err != nil {
+		return 0, err
+	}
+	return int(status.Messages), nil
+}
+
+// FetchFrom returns up to limit inbox emails starting at offset (0-based, newest first).
+func (ic *IMAPClient) FetchFrom(offset, limit int) ([]Email, error) {
+	if err := ic.reconnect(); err != nil {
+		return nil, err
+	}
+	if _, err := ic.c.Select("INBOX", true); err != nil {
+		return nil, fmt.Errorf("select inbox: %w", err)
+	}
+
+	allUIDs, err := ic.c.UidSearch(imap.NewSearchCriteria())
+	if err != nil {
+		return nil, fmt.Errorf("search: %w", err)
+	}
+
+	// UIDs arrive oldest-first; reverse for newest-first pagination.
+	for i, j := 0, len(allUIDs)-1; i < j; i, j = i+1, j-1 {
+		allUIDs[i], allUIDs[j] = allUIDs[j], allUIDs[i]
+	}
+
+	if offset >= len(allUIDs) {
+		return nil, nil
+	}
+	page := allUIDs[offset:]
+	if len(page) > limit {
+		page = page[:limit]
+	}
+
+	seqset := new(imap.SeqSet)
+	seqset.AddNum(page...)
+
+	ch := make(chan *imap.Message, 32)
+	done := make(chan error, 1)
+	go func() {
+		done <- ic.c.UidFetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid, imap.FetchFlags}, ch)
+	}()
+
+	var emails []Email
+	for msg := range ch {
+		if msg.Envelope == nil {
+			continue
+		}
+		uidStr := strconv.FormatUint(uint64(msg.Uid), 10)
+		e := Email{
+			ID:      fmt.Sprintf("imap-%s-%s", ic.cfg.Name, uidStr),
+			MsgID:   uidStr,
+			Account: ic.cfg.Name,
+			Date:    msg.Envelope.Date,
+			Subject: msg.Envelope.Subject,
+			Unread:  true,
+		}
+		for _, flag := range msg.Flags {
+			if flag == imap.SeenFlag {
+				e.Unread = false
+				break
+			}
+		}
+		if len(msg.Envelope.From) > 0 {
+			from := msg.Envelope.From[0]
+			e.FromAddr = fmt.Sprintf("%s@%s", from.MailboxName, from.HostName)
+			if from.PersonalName != "" {
+				e.From = from.PersonalName
+			} else {
+				e.From = e.FromAddr
+			}
+		}
+		emails = append(emails, e)
+	}
+	if err := <-done; err != nil {
+		return nil, err
+	}
+	sort.Slice(emails, func(i, j int) bool {
+		return emails[i].Date.After(emails[j].Date)
+	})
+	return emails, nil
+}
+
+// InferLabel searches non-inbox mailboxes for messages from senderDomain and
+// returns the folder with the most matches, or nil if none found.
+func (ic *IMAPClient) InferLabel(senderDomain string) (*Label, error) {
+	if err := ic.reconnect(); err != nil {
+		return nil, err
+	}
+
+	// Collect user folders (excluding system mailboxes).
+	mailboxCh := make(chan *imap.MailboxInfo, 20)
+	listDone := make(chan error, 1)
+	go func() {
+		listDone <- ic.c.List("", "*", mailboxCh)
+	}()
+	skip := map[string]bool{
+		"inbox": true, "drafts": true, "sent": true,
+		"sent messages": true, "deleted messages": true,
+		"trash": true, "junk": true, "spam": true,
+	}
+	var folders []string
+	for m := range mailboxCh {
+		if !skip[strings.ToLower(m.Name)] {
+			folders = append(folders, m.Name)
+		}
+	}
+	if err := <-listDone; err != nil {
+		return nil, err
+	}
+
+	// Search each folder for messages from senderDomain.
+	criteria := imap.NewSearchCriteria()
+	criteria.Header = make(textproto.MIMEHeader)
+	criteria.Header.Set("From", senderDomain)
+
+	counts := make(map[string]int)
+	for _, folder := range folders {
+		if _, err := ic.c.Select(folder, true); err != nil {
+			continue
+		}
+		uids, err := ic.c.UidSearch(criteria)
+		if err != nil || len(uids) == 0 {
+			continue
+		}
+		counts[folder] = len(uids)
+	}
+
+	var best string
+	var bestCount int
+	for name, count := range counts {
+		if count > bestCount {
+			bestCount = count
+			best = name
+		}
+	}
+	if best == "" {
+		return nil, nil
+	}
+	return &Label{ID: best, Name: best}, nil
 }
 
 func (ic *IMAPClient) moveUID(msgID, destMailbox string) error {

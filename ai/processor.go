@@ -40,6 +40,52 @@ func (p *Processor) Categorize(e *email.Email) string {
 	return p.keywordCategorize(e)
 }
 
+// SummarizeDigest returns a 2-3 sentence overview of all emails in the digest.
+// Falls back to a plain count line if AI is disabled or unavailable.
+func (p *Processor) SummarizeDigest(emails []email.Email) string {
+	if len(emails) == 0 {
+		return ""
+	}
+	if !p.cfg.Enabled {
+		return p.fallbackDigestSummary(emails)
+	}
+	var lines []string
+	for _, e := range emails {
+		preview := e.Preview
+		if preview == "" {
+			preview = e.Subject
+		}
+		vip := ""
+		if e.VIP {
+			vip = " [VIP]"
+		}
+		lines = append(lines, fmt.Sprintf("- From: %s%s | Subject: %s | Preview: %s", e.From, vip, e.Subject, preview))
+	}
+	prompt := fmt.Sprintf(
+		"You are an email assistant. Write a 2-3 sentence summary of the inbox below. Highlight anything urgent or from important senders, group related themes, and give an overall sense of what needs attention. Reply with only the summary — no greeting, no preamble.\n\n%s",
+		strings.Join(lines, "\n"),
+	)
+	summary, err := p.generate(prompt)
+	if err != nil {
+		log.Printf("ollama digest summary: %v", err)
+		return p.fallbackDigestSummary(emails)
+	}
+	return clean(summary)
+}
+
+func (p *Processor) fallbackDigestSummary(emails []email.Email) string {
+	vips := 0
+	for _, e := range emails {
+		if e.VIP {
+			vips++
+		}
+	}
+	if vips > 0 {
+		return fmt.Sprintf("%d new email(s), including %d from VIP sender(s).", len(emails), vips)
+	}
+	return fmt.Sprintf("%d new email(s).", len(emails))
+}
+
 // Summarize returns a one-sentence AI summary, or the raw preview if Ollama is off/unavailable.
 func (p *Processor) Summarize(e *email.Email) string {
 	if !p.cfg.Enabled || e.Preview == "" {
