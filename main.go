@@ -64,23 +64,29 @@ func main() {
 	if len(users) == 0 {
 		log.Fatal("no users configured — add a 'users' section or set mattermost.dm_user")
 	}
+	if generated, err := config.EnsureUserIDs(*configPath, users); err != nil {
+		log.Printf("warning: could not persist user IDs: %v", err)
+	} else if generated {
+		log.Printf("generated UUIDs for new user(s) — saved to config")
+	}
 
 	userCtxs := buildUserContexts(cfg, users)
 
 	// Union of all clients across users for button-callback routing.
 	allClients := make(map[string]email.Actioner)
 	userMMMap := make(map[string]*notify.Mattermost)
-	for _, uctx := range userCtxs {
+	for _, u := range users {
+		uctx := userCtxs[u.ID]
 		for name, c := range uctx.clients {
 			allClients[name] = c
 		}
-		userMMMap[uctx.username] = uctx.mm
+		userMMMap[u.ID] = uctx.mm
 	}
 
 	var ah *actions.Handler
 	if cfg.Mattermost.CallbackURL != "" {
 		// Use the first user's MM as the fallback for posts that lack a user context.
-		fallbackMM := userCtxs[users[0].MattermostUser].mm
+		fallbackMM := userCtxs[users[0].ID].mm
 		ah = &actions.Handler{
 			Clients:       allClients,
 			MMClient:      fallbackMM,
@@ -167,8 +173,8 @@ func main() {
 	}
 
 	// Start a poll loop and wire a digest function for each user.
-	for _, uctx := range userCtxs {
-		uctx := uctx
+	for _, u := range users {
+		uctx := userCtxs[u.ID]
 		digestFn := func(accountFilter string) error {
 			return digest(uctx, cfg, db, ah, accountFilter)
 		}
@@ -227,20 +233,20 @@ func buildUserContexts(cfg *config.Config, users []config.User) map[string]*user
 				if acc, ok := accountByName[name]; ok {
 					userAccounts = append(userAccounts, acc)
 				} else {
-					log.Printf("[%s] account %q not found in config", u.MattermostUser, name)
+					log.Printf("[%s] account %q not found in config", u.ID, name)
 				}
 			}
 		}
 
 		prefs, err := config.LoadPreferences(u.Preferences)
 		if err != nil {
-			log.Printf("[%s] preferences: %v — using defaults", u.MattermostUser, err)
+			log.Printf("[%s] preferences: %v — using defaults", u.ID, err)
 			prefs = &config.Preferences{Digest: config.DigestOpts{MaxPreviewLength: 150, VIPFirst: true}}
 		}
 
 		clients := buildActionClients(userAccounts)
-		ctxs[u.MattermostUser] = &userCtx{
-			username:   u.MattermostUser,
+		ctxs[u.ID] = &userCtx{
+			username:   u.ID,
 			mm:         notify.NewMattermostForUser(cfg.Mattermost, u.MattermostUser),
 			prefs:      prefs,
 			prefsPath:  u.Preferences,
@@ -255,6 +261,12 @@ func buildUserContexts(cfg *config.Config, users []config.User) map[string]*user
 }
 
 func digest(uctx *userCtx, cfg *config.Config, db *storage.DB, ah *actions.Handler, accountFilter string) error {
+	if !uctx.digestMu.TryLock() {
+		log.Printf("[%s] digest already in progress, skipping", uctx.username)
+		return nil
+	}
+	defer uctx.digestMu.Unlock()
+
 	t0 := time.Now()
 	log.Printf("[%s] running digest...", uctx.username)
 	now := t0

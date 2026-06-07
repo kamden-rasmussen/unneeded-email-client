@@ -99,6 +99,11 @@ func migrateSchema(db *sql.DB) {
 	if db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('digest_emails') WHERE name='from_addr'`).Scan(&n) == nil && n == 0 {
 		db.Exec("ALTER TABLE digest_emails ADD COLUMN from_addr TEXT NOT NULL DEFAULT ''") //nolint:errcheck
 	}
+
+	// sender_suggestions: add user column if not present (added when multi-user support landed)
+	if db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sender_suggestions') WHERE name='user'`).Scan(&n) == nil && n == 0 {
+		db.Exec("ALTER TABLE sender_suggestions ADD COLUMN user TEXT NOT NULL DEFAULT ''") //nolint:errcheck
+	}
 }
 
 func (d *DB) IsSeen(id string) (bool, error) {
@@ -269,6 +274,43 @@ func (d *DB) SetSenderSuggestion(user, domain, labelID, labelName, source string
 		user, domain, labelID, labelName, source,
 	)
 	return err
+}
+
+// MigrateUserKeys renames user keys from old Mattermost usernames to UUIDs across all
+// user-scoped tables. Safe to call on every startup — rows already using UUIDs are untouched.
+func (d *DB) MigrateUserKeys(oldToNew map[string]string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	for old, newKey := range oldToNew {
+		if old == "" || old == newKey {
+			continue
+		}
+		if _, err := tx.Exec("UPDATE digest_emails SET user = ? WHERE user = ?", newKey, old); err != nil {
+			return fmt.Errorf("migrate digest_emails %s: %w", old, err)
+		}
+		if _, err := tx.Exec("UPDATE sender_suggestions SET user = ? WHERE user = ?", newKey, old); err != nil {
+			return fmt.Errorf("migrate sender_suggestions %s: %w", old, err)
+		}
+		oldKey := "cursor:" + old
+		newCursorKey := "cursor:" + newKey
+		var exists int
+		tx.QueryRow("SELECT COUNT(*) FROM poll_state WHERE key = ?", newCursorKey).Scan(&exists) //nolint:errcheck
+		if exists > 0 {
+			// New key already written by poll loop — drop the old one.
+			if _, err := tx.Exec("DELETE FROM poll_state WHERE key = ?", oldKey); err != nil {
+				return fmt.Errorf("migrate poll_state %s: %w", old, err)
+			}
+		} else {
+			if _, err := tx.Exec("UPDATE poll_state SET key = ? WHERE key = ?", newCursorKey, oldKey); err != nil {
+				return fmt.Errorf("migrate poll_state %s: %w", old, err)
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func (d *DB) Close() error {
