@@ -61,6 +61,17 @@ func (h *Handler) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 		if newClient, err := pending.refresh(); err == nil {
 			h.Clients[pending.accountName] = newClient
 			if pending.newAccount != nil && h.AddAccount != nil {
+				// Populate the email address from the Gmail API before persisting.
+				type emailGetter interface {
+					GetEmailAddress() (string, error)
+				}
+				if eg, ok := newClient.(emailGetter); ok {
+					if addr, err := eg.GetEmailAddress(); err == nil {
+						pending.newAccount.Email = addr
+					} else {
+						log.Printf("fetch email address for %s: %v", pending.accountName, err)
+					}
+				}
 				if err := h.AddAccount(*pending.newAccount, newClient); err != nil {
 					log.Printf("persist new account %s: %v", pending.accountName, err)
 				}
