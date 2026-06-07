@@ -97,7 +97,7 @@ func NewMattermostForUser(cfg config.Mattermost, dmUser string) *Mattermost {
 // CallbackURL is configured; otherwise falls back to a plain text message.
 // totalCounts maps account name → total inbox message count for "X of Y" header display.
 // nextOffsets maps account name → inbox offset for the "load next chunk" button; omit or nil to suppress.
-func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int, nextOffsets map[string]int) error {
+func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int, nextOffsets map[string]int, summary string) error {
 	header := fmt.Sprintf("### Email Digest — %s", time.Now().Format("Monday, January 2"))
 
 	if len(emails) == 0 {
@@ -108,7 +108,10 @@ func (m *Mattermost) SendDigest(emails []email.Email, totalCounts map[string]int
 		return m.PostMessage(formatDigest(emails))
 	}
 
-	header += fmt.Sprintf("\n\n**%d new email(s)**  _Reply with `archive 1 2`, `read 3`, `done all` if buttons aren't working_", len(emails))
+	if summary != "" {
+		header += "\n\n" + summary
+	}
+	header += fmt.Sprintf("\n\n_**%d email(s)** — reply `archive 1 2`, `read 3`, `done all` if buttons aren't working_", len(emails))
 
 	// sessionTotal is the highest email number in this batch; used for [N/total] display.
 	sessionTotal := emails[len(emails)-1].Number
