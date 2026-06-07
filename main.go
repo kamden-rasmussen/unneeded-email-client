@@ -584,15 +584,30 @@ func processPoll(db *storage.DB, mm *notify.Mattermost, username string, execute
 	if cursor == 0 {
 		return db.SetPollCursor(username, time.Now().UnixMilli())
 	}
-	messages, err := mm.GetNewMessages(cursor)
+	messages, maxSeen, err := mm.GetNewMessages(cursor)
 	if err != nil {
 		return err
 	}
-	now := time.Now().UnixMilli()
+	log.Printf("[%s] poll: cursor=%d maxSeen=%d messages=%d", username, cursor, maxSeen, len(messages))
+	// Advance the cursor using Mattermost's own timestamps to avoid clock-skew duplicates.
+	if maxSeen > cursor {
+		if err := db.SetPollCursor(username, maxSeen); err != nil {
+			return err
+		}
+	}
+	digestQueued := false
 	for _, msg := range messages {
-		reply, err := executeFn(strings.TrimSpace(msg.Message))
+		text := strings.TrimSpace(msg.Message)
+		if isDigestCommand(text) {
+			if digestQueued {
+				log.Printf("[%s] skipping duplicate digest command %q", username, text)
+				continue
+			}
+			digestQueued = true
+		}
+		reply, err := executeFn(text)
 		if err != nil {
-			log.Printf("[%s] command %q: %v", username, msg.Message, err)
+			log.Printf("[%s] command %q: %v", username, text, err)
 			mm.PostMessage("Error: " + err.Error()) //nolint:errcheck
 			continue
 		}
@@ -600,7 +615,22 @@ func processPoll(db *storage.DB, mm *notify.Mattermost, username string, execute
 			mm.PostMessage(reply) //nolint:errcheck
 		}
 	}
-	return db.SetPollCursor(username, now)
+	return nil
+}
+
+// isDigestCommand reports whether text triggers a full email digest fetch.
+func isDigestCommand(text string) bool {
+	fields := strings.Fields(strings.ToLower(text))
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "check", "digest":
+		return true
+	case "list":
+		return len(fields) == 1 || fields[1] != "accounts"
+	}
+	return false
 }
 
 // executeCommand parses and runs a command. Known keywords are handled directly;
