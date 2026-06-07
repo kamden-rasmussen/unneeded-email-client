@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +40,7 @@ type userCtx struct {
 	suggesters map[string]email.Suggester
 	counters   map[string]email.Counter
 	accounts   []config.Account
+	digestMu   sync.Mutex
 }
 
 func main() {
@@ -397,12 +399,13 @@ func digest(uctx *userCtx, cfg *config.Config, db *storage.DB, ah *actions.Handl
 		}
 		log.Printf("[%s] digest: showing %d of %d", acc, shown, total)
 	}
-	if err := uctx.mm.SendDigest(newEmails, totalCounts, nextOffsets); err != nil {
+
+	summary := uctx.proc.SummarizeDigest(newEmails)
+	if err := uctx.mm.SendDigest(newEmails, totalCounts, nextOffsets, summary); err != nil {
 		return err
 	}
 	log.Printf("[%s] send: %s, total: %s", uctx.username, time.Since(tSend).Round(time.Millisecond), time.Since(t0).Round(time.Millisecond))
-
-	return db.SetPollCursor(uctx.username, time.Now().UnixMilli())
+	return nil
 }
 
 func fetchAccount(acc config.Account, db *storage.DB) ([]email.Email, error) {
@@ -535,7 +538,7 @@ func loadNextChunk(uctx *userCtx, account string, offset int, db *storage.DB) er
 		nextOffsets = map[string]int{account: offset + maxPerAccountConst}
 	}
 
-	return uctx.mm.SendDigest(chunk, nil, nextOffsets)
+	return uctx.mm.SendDigest(chunk, nil, nextOffsets, "")
 }
 
 func buildActionClients(accounts []config.Account) map[string]email.Actioner {
