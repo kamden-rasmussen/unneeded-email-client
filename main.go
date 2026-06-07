@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +40,7 @@ type userCtx struct {
 	suggesters map[string]email.Suggester
 	counters   map[string]email.Counter
 	accounts   []config.Account
+	digestMu   sync.Mutex
 }
 
 func main() {
@@ -64,23 +66,29 @@ func main() {
 	if len(users) == 0 {
 		log.Fatal("no users configured — add a 'users' section or set mattermost.dm_user")
 	}
+	if generated, err := config.EnsureUserIDs(*configPath, users); err != nil {
+		log.Printf("warning: could not persist user IDs: %v", err)
+	} else if generated {
+		log.Printf("generated UUIDs for new user(s) — saved to config")
+	}
 
 	userCtxs := buildUserContexts(cfg, users)
 
 	// Union of all clients across users for button-callback routing.
 	allClients := make(map[string]email.Actioner)
 	userMMMap := make(map[string]*notify.Mattermost)
-	for _, uctx := range userCtxs {
+	for _, u := range users {
+		uctx := userCtxs[u.ID]
 		for name, c := range uctx.clients {
 			allClients[name] = c
 		}
-		userMMMap[uctx.username] = uctx.mm
+		userMMMap[u.ID] = uctx.mm
 	}
 
 	var ah *actions.Handler
 	if cfg.Mattermost.CallbackURL != "" {
 		// Use the first user's MM as the fallback for posts that lack a user context.
-		fallbackMM := userCtxs[users[0].MattermostUser].mm
+		fallbackMM := userCtxs[users[0].ID].mm
 		ah = &actions.Handler{
 			Clients:       allClients,
 			MMClient:      fallbackMM,
@@ -167,8 +175,8 @@ func main() {
 	}
 
 	// Start a poll loop and wire a digest function for each user.
-	for _, uctx := range userCtxs {
-		uctx := uctx
+	for _, u := range users {
+		uctx := userCtxs[u.ID]
 		digestFn := func(accountFilter string) error {
 			return digest(uctx, cfg, db, ah, accountFilter)
 		}
@@ -227,20 +235,20 @@ func buildUserContexts(cfg *config.Config, users []config.User) map[string]*user
 				if acc, ok := accountByName[name]; ok {
 					userAccounts = append(userAccounts, acc)
 				} else {
-					log.Printf("[%s] account %q not found in config", u.MattermostUser, name)
+					log.Printf("[%s] account %q not found in config", u.ID, name)
 				}
 			}
 		}
 
 		prefs, err := config.LoadPreferences(u.Preferences)
 		if err != nil {
-			log.Printf("[%s] preferences: %v — using defaults", u.MattermostUser, err)
+			log.Printf("[%s] preferences: %v — using defaults", u.ID, err)
 			prefs = &config.Preferences{Digest: config.DigestOpts{MaxPreviewLength: 150, VIPFirst: true}}
 		}
 
 		clients := buildActionClients(userAccounts)
-		ctxs[u.MattermostUser] = &userCtx{
-			username:   u.MattermostUser,
+		ctxs[u.ID] = &userCtx{
+			username:   u.ID,
 			mm:         notify.NewMattermostForUser(cfg.Mattermost, u.MattermostUser),
 			prefs:      prefs,
 			prefsPath:  u.Preferences,
@@ -255,6 +263,12 @@ func buildUserContexts(cfg *config.Config, users []config.User) map[string]*user
 }
 
 func digest(uctx *userCtx, cfg *config.Config, db *storage.DB, ah *actions.Handler, accountFilter string) error {
+	if !uctx.digestMu.TryLock() {
+		log.Printf("[%s] digest already in progress, skipping", uctx.username)
+		return nil
+	}
+	defer uctx.digestMu.Unlock()
+
 	t0 := time.Now()
 	log.Printf("[%s] running digest...", uctx.username)
 	now := t0
@@ -385,12 +399,13 @@ func digest(uctx *userCtx, cfg *config.Config, db *storage.DB, ah *actions.Handl
 		}
 		log.Printf("[%s] digest: showing %d of %d", acc, shown, total)
 	}
-	if err := uctx.mm.SendDigest(newEmails, totalCounts, nextOffsets); err != nil {
+
+	summary := uctx.proc.SummarizeDigest(newEmails)
+	if err := uctx.mm.SendDigest(newEmails, totalCounts, nextOffsets, summary); err != nil {
 		return err
 	}
 	log.Printf("[%s] send: %s, total: %s", uctx.username, time.Since(tSend).Round(time.Millisecond), time.Since(t0).Round(time.Millisecond))
-
-	return db.SetPollCursor(uctx.username, time.Now().UnixMilli())
+	return nil
 }
 
 func fetchAccount(acc config.Account, db *storage.DB) ([]email.Email, error) {
@@ -523,7 +538,7 @@ func loadNextChunk(uctx *userCtx, account string, offset int, db *storage.DB) er
 		nextOffsets = map[string]int{account: offset + maxPerAccountConst}
 	}
 
-	return uctx.mm.SendDigest(chunk, nil, nextOffsets)
+	return uctx.mm.SendDigest(chunk, nil, nextOffsets, "")
 }
 
 func buildActionClients(accounts []config.Account) map[string]email.Actioner {
@@ -569,15 +584,30 @@ func processPoll(db *storage.DB, mm *notify.Mattermost, username string, execute
 	if cursor == 0 {
 		return db.SetPollCursor(username, time.Now().UnixMilli())
 	}
-	messages, err := mm.GetNewMessages(cursor)
+	messages, maxSeen, err := mm.GetNewMessages(cursor)
 	if err != nil {
 		return err
 	}
-	now := time.Now().UnixMilli()
+	log.Printf("[%s] poll: cursor=%d maxSeen=%d messages=%d", username, cursor, maxSeen, len(messages))
+	// Advance the cursor using Mattermost's own timestamps to avoid clock-skew duplicates.
+	if maxSeen > cursor {
+		if err := db.SetPollCursor(username, maxSeen); err != nil {
+			return err
+		}
+	}
+	digestQueued := false
 	for _, msg := range messages {
-		reply, err := executeFn(strings.TrimSpace(msg.Message))
+		text := strings.TrimSpace(msg.Message)
+		if isDigestCommand(text) {
+			if digestQueued {
+				log.Printf("[%s] skipping duplicate digest command %q", username, text)
+				continue
+			}
+			digestQueued = true
+		}
+		reply, err := executeFn(text)
 		if err != nil {
-			log.Printf("[%s] command %q: %v", username, msg.Message, err)
+			log.Printf("[%s] command %q: %v", username, text, err)
 			mm.PostMessage("Error: " + err.Error()) //nolint:errcheck
 			continue
 		}
@@ -585,7 +615,22 @@ func processPoll(db *storage.DB, mm *notify.Mattermost, username string, execute
 			mm.PostMessage(reply) //nolint:errcheck
 		}
 	}
-	return db.SetPollCursor(username, now)
+	return nil
+}
+
+// isDigestCommand reports whether text triggers a full email digest fetch.
+func isDigestCommand(text string) bool {
+	fields := strings.Fields(strings.ToLower(text))
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "check", "digest":
+		return true
+	case "list":
+		return len(fields) == 1 || fields[1] != "accounts"
+	}
+	return false
 }
 
 // executeCommand parses and runs a command. Known keywords are handled directly;
