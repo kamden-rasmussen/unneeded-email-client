@@ -132,14 +132,6 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the Mattermost-supplied user matches the user embedded in the context.
-	// This prevents a forged request from acting as a different user even if the
-	// webhook_secret is known.
-	if p.Context.User != "" && p.UserName != "" && p.UserName != p.Context.User {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
 	ctx := p.Context
 
 	// Actions that operate on a specific email require a valid account client.
