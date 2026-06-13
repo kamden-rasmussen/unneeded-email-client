@@ -103,6 +103,17 @@ func main() {
 				}
 				cfg.Accounts = append(cfg.Accounts, acc)
 				allClients[acc.Name] = client
+				// Update live user contexts so the new account appears in the next digest.
+				for _, uctx := range userCtxs {
+					uctx.accounts = append(uctx.accounts, acc)
+					uctx.clients[acc.Name] = client
+					if s, ok := client.(email.Suggester); ok {
+						uctx.suggesters[acc.Name] = s
+					}
+					if cnt, ok := client.(email.Counter); ok {
+						uctx.counters[acc.Name] = cnt
+					}
+				}
 				return nil
 			},
 			RenameAccount: func(oldName, newName string) error {
@@ -132,6 +143,18 @@ func main() {
 					return fmt.Errorf("unknown user %q", user)
 				}
 				return loadNextChunk(uctx, account, offset, db)
+			},
+			OnAccountAdded: func(accountName string) {
+				for _, uctx := range userCtxs {
+					for _, acc := range uctx.accounts {
+						if acc.Name == accountName {
+							if err := digest(uctx, cfg, db, ah, accountName); err != nil {
+								log.Printf("post-add digest for %s: %v", accountName, err)
+							}
+							break
+						}
+					}
+				}
 			},
 			TriggerReauth: func(accountName string) {
 				for _, uctx := range userCtxs {

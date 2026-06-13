@@ -74,6 +74,8 @@ func (h *Handler) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 				}
 				if err := h.AddAccount(*pending.newAccount, newClient); err != nil {
 					log.Printf("persist new account %s: %v", pending.accountName, err)
+				} else if h.OnAccountAdded != nil {
+					go h.OnAccountAdded(pending.accountName)
 				}
 			}
 		} else {
