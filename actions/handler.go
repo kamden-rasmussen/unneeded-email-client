@@ -156,8 +156,32 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	_, isIMAP := client.(*email.IMAPClient)
+
 	switch ctx.Action {
 	case "archive":
+		mm := h.getMMForUser(ctx.User)
+		if isIMAP {
+			// IMAP operations require a full TLS reconnect and can exceed Mattermost's
+			// 3-second button timeout. Respond immediately and patch the post async.
+			respondButton(w, buttonResponse{EphemeralText: "Archiving…"})
+			postID, number, msgID, emailID := p.PostID, ctx.Number, ctx.MsgID, ctx.EmailID
+			go func() {
+				if err := client.MarkRead(msgID); err != nil {
+					log.Printf("mark_read before archive %s: %v", emailID, err)
+				}
+				if err := client.Archive(msgID); err != nil {
+					log.Printf("archive %s: %v", emailID, err)
+					mm.PostMessage("Error archiving: " + err.Error()) //nolint:errcheck
+					return
+				}
+				log.Printf("archived %s", emailID)
+				if err := updatePostDone(mm, postID, number, "Archived"); err != nil {
+					log.Printf("update post %s: %v", postID, err)
+				}
+			}()
+			return
+		}
 		if err := client.MarkRead(ctx.MsgID); err != nil {
 			log.Printf("mark_read before archive %s: %v", ctx.EmailID, err)
 		}
@@ -167,7 +191,6 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("archived %s", ctx.EmailID)
-		mm := h.getMMForUser(ctx.User)
 		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Archived")
 		resp := buttonResponse{EphemeralText: "Archived ✓"}
 		if props != nil {
@@ -176,15 +199,9 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		respondButton(w, resp)
 
 	case "mark_read":
-		if err := client.MarkRead(ctx.MsgID); err != nil {
-			log.Printf("mark_read %s: %v", ctx.EmailID, err)
-			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
-			return
-		}
-		log.Printf("marked read %s", ctx.EmailID)
 		mm := h.getMMForUser(ctx.User)
 		n := strconv.Itoa(ctx.Number)
-		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Read", func(att *notify.Attachment) {
+		swapToUnread := func(att *notify.Attachment) {
 			att.Color = ""
 			for i, a := range att.Actions {
 				if a.ID == "rd"+n {
@@ -196,7 +213,30 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
-		})
+		}
+		if isIMAP {
+			respondButton(w, buttonResponse{EphemeralText: "Marking read…"})
+			postID, number, msgID, emailID := p.PostID, ctx.Number, ctx.MsgID, ctx.EmailID
+			go func() {
+				if err := client.MarkRead(msgID); err != nil {
+					log.Printf("mark_read %s: %v", emailID, err)
+					mm.PostMessage("Error marking read: " + err.Error()) //nolint:errcheck
+					return
+				}
+				log.Printf("marked read %s", emailID)
+				if err := updatePostDone(mm, postID, number, "Marked Read", swapToUnread); err != nil {
+					log.Printf("update post %s: %v", postID, err)
+				}
+			}()
+			return
+		}
+		if err := client.MarkRead(ctx.MsgID); err != nil {
+			log.Printf("mark_read %s: %v", ctx.EmailID, err)
+			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
+			return
+		}
+		log.Printf("marked read %s", ctx.EmailID)
+		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Read", swapToUnread)
 		resp := buttonResponse{EphemeralText: "Marked Read ✓"}
 		if props != nil {
 			resp.Update = &buttonUpdate{Props: props}
@@ -204,15 +244,9 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 		respondButton(w, resp)
 
 	case "mark_unread":
-		if err := client.MarkUnread(ctx.MsgID); err != nil {
-			log.Printf("mark_unread %s: %v", ctx.EmailID, err)
-			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
-			return
-		}
-		log.Printf("marked unread %s", ctx.EmailID)
 		mm := h.getMMForUser(ctx.User)
 		n := strconv.Itoa(ctx.Number)
-		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Unread", func(att *notify.Attachment) {
+		swapToRead := func(att *notify.Attachment) {
 			att.Color = "#1976D2"
 			for i, a := range att.Actions {
 				if a.ID == "ur"+n {
@@ -224,7 +258,30 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
-		})
+		}
+		if isIMAP {
+			respondButton(w, buttonResponse{EphemeralText: "Marking unread…"})
+			postID, number, msgID, emailID := p.PostID, ctx.Number, ctx.MsgID, ctx.EmailID
+			go func() {
+				if err := client.MarkUnread(msgID); err != nil {
+					log.Printf("mark_unread %s: %v", emailID, err)
+					mm.PostMessage("Error marking unread: " + err.Error()) //nolint:errcheck
+					return
+				}
+				log.Printf("marked unread %s", emailID)
+				if err := updatePostDone(mm, postID, number, "Marked Unread", swapToRead); err != nil {
+					log.Printf("update post %s: %v", postID, err)
+				}
+			}()
+			return
+		}
+		if err := client.MarkUnread(ctx.MsgID); err != nil {
+			log.Printf("mark_unread %s: %v", ctx.EmailID, err)
+			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
+			return
+		}
+		log.Printf("marked unread %s", ctx.EmailID)
+		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Marked Unread", swapToRead)
 		resp := buttonResponse{EphemeralText: "Marked Unread ✓"}
 		if props != nil {
 			resp.Update = &buttonUpdate{Props: props}
@@ -233,17 +290,36 @@ func (h *Handler) handleEmailAction(w http.ResponseWriter, r *http.Request) {
 
 	case "move_direct":
 		// Suggested label — one-click move with no dialog.
+		mm := h.getMMForUser(ctx.User)
+		if isIMAP {
+			respondButton(w, buttonResponse{EphemeralText: "Moving…"})
+			postID, number, msgID, emailID := p.PostID, ctx.Number, ctx.MsgID, ctx.EmailID
+			labelID, labelName, senderDomain, user := ctx.LabelID, ctx.LabelName, ctx.SenderDomain, ctx.User
+			go func() {
+				if err := client.MoveToLabel(msgID, labelID); err != nil {
+					log.Printf("move_direct %s: %v", emailID, err)
+					mm.PostMessage("Error moving: " + err.Error()) //nolint:errcheck
+					return
+				}
+				log.Printf("moved %s to %s (suggested)", emailID, labelName)
+				if h.DB != nil && senderDomain != "" {
+					h.DB.SetSenderSuggestion(user, senderDomain, labelID, labelName, "user") //nolint:errcheck
+				}
+				if err := updatePostDone(mm, postID, number, "Moved to "+labelName); err != nil {
+					log.Printf("update post %s: %v", postID, err)
+				}
+			}()
+			return
+		}
 		if err := client.MoveToLabel(ctx.MsgID, ctx.LabelID); err != nil {
 			log.Printf("move_direct %s: %v", ctx.EmailID, err)
 			respondButton(w, buttonResponse{EphemeralText: "Error: " + err.Error()})
 			return
 		}
 		log.Printf("moved %s to %s (suggested)", ctx.EmailID, ctx.LabelName)
-		// Record user confirmation to improve future suggestions.
 		if h.DB != nil && ctx.SenderDomain != "" {
 			h.DB.SetSenderSuggestion(ctx.User, ctx.SenderDomain, ctx.LabelID, ctx.LabelName, "user") //nolint:errcheck
 		}
-		mm := h.getMMForUser(ctx.User)
 		props, _ := markedDoneProps(mm, p.PostID, ctx.Number, "Moved to "+ctx.LabelName)
 		resp := buttonResponse{EphemeralText: "Moved to " + ctx.LabelName + " ✓"}
 		if props != nil {
@@ -919,7 +995,7 @@ func markedDoneProps(mm *notify.Mattermost, postID string, number int, label str
 
 // updatePostDone patches the post directly (used after dialog submissions, which
 // cannot return an "update" in their response).
-func updatePostDone(mm *notify.Mattermost, postID string, number int, label string) error {
+func updatePostDone(mm *notify.Mattermost, postID string, number int, label string, mutate ...func(*notify.Attachment)) error {
 	message, atts, ok := mm.GetDigestPost(postID)
 	if !ok {
 		return fmt.Errorf("post %s not in digest cache", postID)
@@ -931,6 +1007,9 @@ func updatePostDone(mm *notify.Mattermost, postID string, number int, label stri
 				atts[i].Text = att.Text + "\n\n**" + label + " ✓**"
 			} else {
 				atts[i].Text = "**" + label + " ✓**"
+			}
+			if len(mutate) > 0 {
+				mutate[0](&atts[i])
 			}
 			break
 		}
