@@ -39,7 +39,8 @@ type Handler struct {
 	// TriggerReauth, when set, initiates OAuth re-authorization for an account
 	// and sends the auth link via Mattermost.
 	TriggerReauth func(accountName string)
-	pendingOAuths sync.Map // state string → *pendingOAuth
+	pendingOAuths     sync.Map // state string → *pendingOAuth
+	pendingIMAPSetups sync.Map // token string → *imapPendingSetup
 }
 
 // getMMForUser returns the Mattermost client for the given user, falling back to MMClient.
@@ -60,7 +61,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/actions/delete_confirm", h.handleDeleteConfirmDialog)
 	mux.HandleFunc("/setup/gmail/callback", h.handleGmailCallback)
 	mux.HandleFunc("/setup/imap/start", h.handleIMAPStart)
-	mux.HandleFunc("/setup/imap/callback", h.handleIMAPCallback)
+	mux.HandleFunc("/setup/imap/form", h.handleIMAPForm)
 }
 
 // StartGmailReauth generates an OAuth2 authorization URL for re-authorizing a Gmail account.
