@@ -228,6 +228,8 @@ func (h *Handler) handleIMAPForm(w http.ResponseWriter, r *http.Request) {
 					if h.AddAccount != nil {
 						if err := h.AddAccount(acc, liveClient); err != nil {
 							log.Printf("persist imap account %s: %v", acc.Name, err)
+						} else if h.OnAccountAdded != nil {
+							go h.OnAccountAdded(acc.Name)
 						}
 					}
 					log.Printf("added %s account %q (%s)", pending.accountType, acc.Name, acc.Email)

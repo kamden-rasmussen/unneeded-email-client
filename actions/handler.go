@@ -39,6 +39,9 @@ type Handler struct {
 	// TriggerReauth, when set, initiates OAuth re-authorization for an account
 	// and sends the auth link via Mattermost.
 	TriggerReauth func(accountName string)
+	// OnAccountAdded, when set, is called after a new account is successfully added.
+	// It should trigger a digest for the new account so emails appear immediately.
+	OnAccountAdded func(accountName string)
 	pendingOAuths     sync.Map // state string → *pendingOAuth
 	pendingIMAPSetups sync.Map // token string → *imapPendingSetup
 }
