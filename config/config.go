@@ -199,6 +199,56 @@ func AppendAccount(path string, acc Account) error {
 	return enc.Encode(&raw)
 }
 
+// RemoveAccount reads the config at path, removes the named account, and writes it back.
+// Returns the removed Account so the caller can clean up token files etc.
+func RemoveAccount(path, name string) (Account, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return Account{}, fmt.Errorf("reading config: %w", err)
+	}
+	var raw Config
+	if err := yaml.NewDecoder(f).Decode(&raw); err != nil {
+		f.Close()
+		return Account{}, fmt.Errorf("parsing config: %w", err)
+	}
+	f.Close()
+
+	var removed Account
+	found := false
+	filtered := make([]Account, 0, len(raw.Accounts))
+	for _, acc := range raw.Accounts {
+		if acc.Name == name {
+			removed = acc
+			found = true
+		} else {
+			filtered = append(filtered, acc)
+		}
+	}
+	if !found {
+		return Account{}, fmt.Errorf("account %q not found in config", name)
+	}
+	raw.Accounts = filtered
+
+	for i := range raw.Users {
+		updated := make([]string, 0, len(raw.Users[i].Accounts))
+		for _, n := range raw.Users[i].Accounts {
+			if n != name {
+				updated = append(updated, n)
+			}
+		}
+		raw.Users[i].Accounts = updated
+	}
+
+	out, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		return Account{}, fmt.Errorf("writing config: %w", err)
+	}
+	defer out.Close()
+	enc := yaml.NewEncoder(out)
+	enc.SetIndent(2)
+	return removed, enc.Encode(&raw)
+}
+
 func LoadPreferences(path string) (*Preferences, error) {
 	f, err := os.Open(path)
 	if err != nil {

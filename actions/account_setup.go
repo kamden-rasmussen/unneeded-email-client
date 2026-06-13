@@ -41,6 +41,25 @@ func (h *Handler) HandleRenameCommand(oldName, newName string) {
 	h.MMClient.PostMessage(fmt.Sprintf("✓ Account renamed **%s** → **%s**.", oldName, newName)) //nolint:errcheck
 }
 
+// HandleRemoveCommand processes a "remove <name>" text command from the DM channel.
+func (h *Handler) HandleRemoveCommand(name string) {
+	if _, exists := h.Clients[name]; !exists {
+		h.MMClient.PostMessage(fmt.Sprintf("Account **%s** not found.", name)) //nolint:errcheck
+		return
+	}
+
+	if h.RemoveAccount != nil {
+		if err := h.RemoveAccount(name); err != nil {
+			log.Printf("remove account %s: %v", name, err)
+			h.MMClient.PostMessage("Error removing account: " + err.Error()) //nolint:errcheck
+			return
+		}
+	}
+
+	delete(h.Clients, name)
+	h.MMClient.PostMessage(fmt.Sprintf("✓ Account **%s** removed.", name)) //nolint:errcheck
+}
+
 // HandleAddCommand processes an "add <type> <name>" text command from the DM channel.
 func (h *Handler) HandleAddCommand(accountType, name string) {
 	if _, exists := h.Clients[name]; exists {

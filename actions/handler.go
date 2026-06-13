@@ -33,6 +33,8 @@ type Handler struct {
 	AddAccount func(acc config.Account, client email.Actioner) error
 	// RenameAccount is called to persist a rename and update live state in main.
 	RenameAccount func(oldName, newName string) error
+	// RemoveAccount is called to remove an account from config and live state.
+	RemoveAccount func(name string) error
 	// NextChunk is called when a user clicks "load next chunk"; it fetches and
 	// posts the next page of emails for the given account starting at offset.
 	NextChunk func(user, account string, offset int) error
