@@ -143,6 +143,47 @@ func main() {
 				}
 				return config.RenameAccount(*configPath, oldName, newName)
 			},
+			RemoveAccount: func(name string) error {
+				removed, err := config.RemoveAccount(*configPath, name)
+				if err != nil {
+					return err
+				}
+				// Remove from in-memory cfg and all client maps.
+				filtered := make([]config.Account, 0, len(cfg.Accounts))
+				for _, acc := range cfg.Accounts {
+					if acc.Name != name {
+						filtered = append(filtered, acc)
+					}
+				}
+				cfg.Accounts = filtered
+				delete(allClients, name)
+				for i := range users {
+					updated := make([]string, 0, len(users[i].Accounts))
+					for _, n := range users[i].Accounts {
+						if n != name {
+							updated = append(updated, n)
+						}
+					}
+					users[i].Accounts = updated
+				}
+				for _, uctx := range userCtxs {
+					filtered := make([]config.Account, 0, len(uctx.accounts))
+					for _, acc := range uctx.accounts {
+						if acc.Name != name {
+							filtered = append(filtered, acc)
+						}
+					}
+					uctx.accounts = filtered
+					delete(uctx.clients, name)
+					delete(uctx.suggesters, name)
+					delete(uctx.counters, name)
+				}
+				// Delete token file if it's the default pattern.
+				if removed.TokenFile != "" {
+					os.Remove(removed.TokenFile) //nolint:errcheck
+				}
+				return nil
+			},
 			NextChunk: func(user, account string, offset int) error {
 				uctx, ok := userCtxs[user]
 				if !ok {
@@ -713,6 +754,17 @@ func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Hand
 		return "", nil
 	}
 
+	if action == "remove" {
+		if len(fields) < 2 {
+			return "Usage: `remove <name>`", nil
+		}
+		if ah == nil {
+			return "Remove requires `callback_url` to be configured.", nil
+		}
+		ah.HandleRemoveCommand(fields[1])
+		return "", nil
+	}
+
 	if action == "archive" || action == "read" || action == "done" || action == "delete" {
 		if len(fields) < 2 {
 			return fmt.Sprintf("Usage: `%s <number> [number...]` or `%s all`", action, action), nil
@@ -759,6 +811,15 @@ func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Hand
 				accountType = "imap"
 			}
 			ah.HandleAddCommand(accountType, cmd.AccountName)
+			return "", nil
+		case "remove_account":
+			if ah == nil {
+				return "Remove requires `callback_url` to be configured.", nil
+			}
+			if cmd.Account == "" {
+				return "Which account do you want to remove?", nil
+			}
+			ah.HandleRemoveCommand(cmd.Account)
 			return "", nil
 		case "unknown":
 			return commandHelp(), nil
@@ -857,6 +918,7 @@ func commandHelp() string {
 		"- `add imap <name>` — add an IMAP account\n" +
 		"- `add icloud <name>` — add an iCloud account\n" +
 		"- `rename <old> <new>` — rename an account\n" +
+		"- `remove <name>` — remove an account\n" +
 		"\nTo create filters, use the **Create Filter...** button on any email card."
 }
 
