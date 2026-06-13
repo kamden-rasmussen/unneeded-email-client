@@ -103,6 +103,12 @@ func main() {
 				}
 				cfg.Accounts = append(cfg.Accounts, acc)
 				allClients[acc.Name] = client
+				// Keep in-memory user account lists in sync with config.
+				for i := range users {
+					if len(users[i].Accounts) > 0 {
+						users[i].Accounts = append(users[i].Accounts, acc.Name)
+					}
+				}
 				// Update live user contexts so the new account appears in the next digest.
 				for _, uctx := range userCtxs {
 					uctx.accounts = append(uctx.accounts, acc)

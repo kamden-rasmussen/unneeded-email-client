@@ -182,6 +182,13 @@ func AppendAccount(path string, acc Account) error {
 
 	raw.Accounts = append(raw.Accounts, acc)
 
+	// Add the new account name to any user that has an explicit accounts list.
+	for i := range raw.Users {
+		if len(raw.Users[i].Accounts) > 0 {
+			raw.Users[i].Accounts = append(raw.Users[i].Accounts, acc.Name)
+		}
+	}
+
 	out, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("writing config: %w", err)
