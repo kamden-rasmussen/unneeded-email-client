@@ -721,6 +721,16 @@ func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Hand
 				return "Couldn't figure out which emails — try: `archive 1 2` or `archive all`", nil
 			}
 			return doEmailAction(cmd.Action, toks, uctx.username, db, uctx.clients)
+		case "add_account":
+			if ah == nil {
+				return "Account setup requires `callback_url` to be configured.", nil
+			}
+			accountType := cmd.AccountType
+			if accountType == "" {
+				accountType = "imap"
+			}
+			ah.HandleAddCommand(accountType, cmd.AccountName)
+			return "", nil
 		case "unknown":
 			return commandHelp(), nil
 		}
@@ -815,6 +825,8 @@ func commandHelp() string {
 		"- `delete <N> [N...]`\n" +
 		"- `done <N> [N...]` / `done all` — archive + mark read\n" +
 		"- `add gmail <name>` — add a Gmail account\n" +
+		"- `add imap <name>` — add an IMAP account\n" +
+		"- `add icloud <name>` — add an iCloud account\n" +
 		"- `rename <old> <new>` — rename an account\n" +
 		"\nTo create filters, use the **Create Filter...** button on any email card."
 }
