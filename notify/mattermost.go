@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -429,9 +430,12 @@ func (m *Mattermost) OpenDialog(triggerID, submitURL, callbackID, title, state, 
 		return err
 	}
 	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("mattermost dialog %d: %s", resp.StatusCode, b)
+	}
+	if len(b) > 2 {
+		log.Printf("open_dialog response: %s", b)
 	}
 	return nil
 }

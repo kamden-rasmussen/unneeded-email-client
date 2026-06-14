@@ -103,6 +103,23 @@ func main() {
 				}
 				cfg.Accounts = append(cfg.Accounts, acc)
 				allClients[acc.Name] = client
+				// Keep in-memory user account lists in sync with config.
+				for i := range users {
+					if len(users[i].Accounts) > 0 {
+						users[i].Accounts = append(users[i].Accounts, acc.Name)
+					}
+				}
+				// Update live user contexts so the new account appears in the next digest.
+				for _, uctx := range userCtxs {
+					uctx.accounts = append(uctx.accounts, acc)
+					uctx.clients[acc.Name] = client
+					if s, ok := client.(email.Suggester); ok {
+						uctx.suggesters[acc.Name] = s
+					}
+					if cnt, ok := client.(email.Counter); ok {
+						uctx.counters[acc.Name] = cnt
+					}
+				}
 				return nil
 			},
 			RenameAccount: func(oldName, newName string) error {
@@ -126,12 +143,65 @@ func main() {
 				}
 				return config.RenameAccount(*configPath, oldName, newName)
 			},
+			RemoveAccount: func(name string) error {
+				removed, err := config.RemoveAccount(*configPath, name)
+				if err != nil {
+					return err
+				}
+				// Remove from in-memory cfg and all client maps.
+				filtered := make([]config.Account, 0, len(cfg.Accounts))
+				for _, acc := range cfg.Accounts {
+					if acc.Name != name {
+						filtered = append(filtered, acc)
+					}
+				}
+				cfg.Accounts = filtered
+				delete(allClients, name)
+				for i := range users {
+					updated := make([]string, 0, len(users[i].Accounts))
+					for _, n := range users[i].Accounts {
+						if n != name {
+							updated = append(updated, n)
+						}
+					}
+					users[i].Accounts = updated
+				}
+				for _, uctx := range userCtxs {
+					filtered := make([]config.Account, 0, len(uctx.accounts))
+					for _, acc := range uctx.accounts {
+						if acc.Name != name {
+							filtered = append(filtered, acc)
+						}
+					}
+					uctx.accounts = filtered
+					delete(uctx.clients, name)
+					delete(uctx.suggesters, name)
+					delete(uctx.counters, name)
+				}
+				// Delete token file if it's the default pattern.
+				if removed.TokenFile != "" {
+					os.Remove(removed.TokenFile) //nolint:errcheck
+				}
+				return nil
+			},
 			NextChunk: func(user, account string, offset int) error {
 				uctx, ok := userCtxs[user]
 				if !ok {
 					return fmt.Errorf("unknown user %q", user)
 				}
 				return loadNextChunk(uctx, account, offset, db)
+			},
+			OnAccountAdded: func(accountName string) {
+				for _, uctx := range userCtxs {
+					for _, acc := range uctx.accounts {
+						if acc.Name == accountName {
+							if err := digest(uctx, cfg, db, ah, accountName); err != nil {
+								log.Printf("post-add digest for %s: %v", accountName, err)
+							}
+							break
+						}
+					}
+				}
 			},
 			TriggerReauth: func(accountName string) {
 				for _, uctx := range userCtxs {
@@ -684,6 +754,17 @@ func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Hand
 		return "", nil
 	}
 
+	if action == "remove" {
+		if len(fields) < 2 {
+			return "Usage: `remove <name>`", nil
+		}
+		if ah == nil {
+			return "Remove requires `callback_url` to be configured.", nil
+		}
+		ah.HandleRemoveCommand(fields[1])
+		return "", nil
+	}
+
 	if action == "archive" || action == "read" || action == "done" || action == "delete" {
 		if len(fields) < 2 {
 			return fmt.Sprintf("Usage: `%s <number> [number...]` or `%s all`", action, action), nil
@@ -721,6 +802,25 @@ func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Hand
 				return "Couldn't figure out which emails — try: `archive 1 2` or `archive all`", nil
 			}
 			return doEmailAction(cmd.Action, toks, uctx.username, db, uctx.clients)
+		case "add_account":
+			if ah == nil {
+				return "Account setup requires `callback_url` to be configured.", nil
+			}
+			accountType := cmd.AccountType
+			if accountType == "" {
+				accountType = "imap"
+			}
+			ah.HandleAddCommand(accountType, cmd.AccountName)
+			return "", nil
+		case "remove_account":
+			if ah == nil {
+				return "Remove requires `callback_url` to be configured.", nil
+			}
+			if cmd.Account == "" {
+				return "Which account do you want to remove?", nil
+			}
+			ah.HandleRemoveCommand(cmd.Account)
+			return "", nil
 		case "unknown":
 			return commandHelp(), nil
 		}
@@ -815,7 +915,10 @@ func commandHelp() string {
 		"- `delete <N> [N...]`\n" +
 		"- `done <N> [N...]` / `done all` — archive + mark read\n" +
 		"- `add gmail <name>` — add a Gmail account\n" +
+		"- `add imap <name>` — add an IMAP account\n" +
+		"- `add icloud <name>` — add an iCloud account\n" +
 		"- `rename <old> <new>` — rename an account\n" +
+		"- `remove <name>` — remove an account\n" +
 		"\nTo create filters, use the **Create Filter...** button on any email card."
 }
 

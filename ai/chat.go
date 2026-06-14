@@ -15,6 +15,8 @@ type InterpretedCommand struct {
 	Sender        string   `json:"sender,omitempty"`
 	FilterActions []string `json:"filter_actions,omitempty"`
 	Label         string   `json:"label,omitempty"`
+	AccountType   string   `json:"account_type,omitempty"`
+	AccountName   string   `json:"account_name,omitempty"`
 }
 
 // Enabled reports whether AI processing is turned on.
@@ -45,6 +47,8 @@ func (p *Processor) Interpret(message string, accounts []string) (*InterpretedCo
 			`{"action":"add_filter","sender":"domain.com","filter_actions":["archive"]}`+" — auto-filter future emails from sender; filter_actions can include archive, mark_read, mute, move; add \"label\":\"Name\" for move\n"+
 			`{"action":"list_filters"} — list active auto-filters`+"\n"+
 			`{"action":"remove_filter","sender":"domain.com"} — remove an auto-filter`+"\n"+
+			`{"action":"add_account","account_type":"imap","account_name":"NAME"} — add an IMAP account; account_type is gmail, imap, or icloud; account_name is a short label chosen by the user or inferred from context (e.g. "outlook", "work"); omit account_name if not mentioned`+"\n"+
+			`{"action":"remove_account","account":"NAME"} — remove an account by name`+"\n"+
 			`{"action":"unknown"} — cannot interpret the message`+"\n\n"+
 			"Available accounts: %s\n\n"+
 			"Reply with ONLY a valid JSON object. No explanation, no markdown fences.\n\n"+
