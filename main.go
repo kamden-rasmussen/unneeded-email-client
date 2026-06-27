@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+	_ "time/tzdata" // embed IANA timezone database
 
 	"github.com/kamden/emailagent/actions"
 	"github.com/kamden/emailagent/ai"
@@ -31,16 +32,19 @@ var (
 
 // userCtx holds all per-user state: Mattermost channel, email clients, preferences, and AI processor.
 type userCtx struct {
-	username   string
-	mm         *notify.Mattermost
-	prefs      *config.Preferences
-	prefsPath  string
-	proc       *ai.Processor // carries per-user prefs for IsVIP/IsMuted/Categorize
-	clients    map[string]email.Actioner
-	suggesters map[string]email.Suggester
-	counters   map[string]email.Counter
-	accounts   []config.Account
-	digestMu   sync.Mutex
+	username        string
+	mattermostUser  string
+	mm              *notify.Mattermost
+	prefs           *config.Preferences
+	prefsPath       string
+	proc            *ai.Processor // carries per-user prefs for IsVIP/IsMuted/Categorize
+	clients         map[string]email.Actioner
+	suggesters      map[string]email.Suggester
+	counters        map[string]email.Counter
+	accounts        []config.Account
+	digestMu        sync.Mutex
+	timezone        string       // IANA timezone for digest scheduling, e.g. "America/Los_Angeles"
+	cronEntryID     cron.EntryID // current cron entry; 0 if not scheduled yet
 }
 
 func main() {
@@ -274,12 +278,55 @@ func main() {
 	}
 
 	c := cron.New()
-	if _, err := c.AddFunc(cfg.Schedule, runAll); err != nil {
-		log.Fatalf("invalid schedule %q: %v", cfg.Schedule, err)
+	scheduleDigestForUser := func(uctx *userCtx) {
+		if uctx.cronEntryID != 0 {
+			c.Remove(uctx.cronEntryID)
+		}
+		tz := uctx.timezone
+		if tz == "" {
+			tz = "UTC"
+		}
+		spec := fmt.Sprintf("CRON_TZ=%s 0 7 * * *", tz)
+		uctxLocal := uctx
+		id, err := c.AddFunc(spec, func() {
+			if err := digest(uctxLocal, cfg, db, ah, ""); err != nil {
+				log.Printf("[%s] digest: %v", uctxLocal.username, err)
+			}
+		})
+		if err != nil {
+			log.Printf("[%s] cron schedule error: %v", uctx.username, err)
+			return
+		}
+		uctx.cronEntryID = id
+		log.Printf("[%s] digest scheduled at 7:00 AM %s", uctx.username, tz)
 	}
+
+	for _, uctx := range userCtxs {
+		scheduleDigestForUser(uctx)
+	}
+
+	if ah != nil {
+		ah.SetTimezone = func(mattermostUser, tz string) error {
+			if _, err := time.LoadLocation(tz); err != nil {
+				return fmt.Errorf("unknown timezone %q", tz)
+			}
+			if err := config.SetUserTimezone(*configPath, mattermostUser, tz); err != nil {
+				return err
+			}
+			for _, uctx := range userCtxs {
+				if uctx.mattermostUser == mattermostUser {
+					uctx.timezone = tz
+					scheduleDigestForUser(uctx)
+					break
+				}
+			}
+			return nil
+		}
+	}
+
 	c.Start()
 
-	log.Printf("email agent running — %d user(s), schedule: %s", len(userCtxs), cfg.Schedule)
+	log.Printf("email agent running — %d user(s)", len(userCtxs))
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -318,15 +365,17 @@ func buildUserContexts(cfg *config.Config, users []config.User) map[string]*user
 
 		clients := buildActionClients(userAccounts)
 		ctxs[u.ID] = &userCtx{
-			username:   u.ID,
-			mm:         notify.NewMattermostForUser(cfg.Mattermost, u.MattermostUser),
-			prefs:      prefs,
-			prefsPath:  u.Preferences,
-			proc:       ai.New(cfg.Ollama, prefs),
-			clients:    clients,
-			suggesters: buildSuggesters(clients),
-			counters:   buildCounters(clients),
-			accounts:   userAccounts,
+			username:       u.ID,
+			mattermostUser: u.MattermostUser,
+			mm:             notify.NewMattermostForUser(cfg.Mattermost, u.MattermostUser),
+			prefs:          prefs,
+			prefsPath:      u.Preferences,
+			proc:           ai.New(cfg.Ollama, prefs),
+			clients:        clients,
+			suggesters:     buildSuggesters(clients),
+			counters:       buildCounters(clients),
+			accounts:       userAccounts,
+			timezone:       u.Timezone,
 		}
 	}
 	return ctxs
@@ -765,6 +814,14 @@ func executeCommand(text string, uctx *userCtx, db *storage.DB, ah *actions.Hand
 		return "", nil
 	}
 
+	if action == "timezone" {
+		if ah == nil {
+			return "Timezone setup requires `callback_url` to be configured.", nil
+		}
+		ah.HandleTimezoneCommand(uctx.mm, uctx.mattermostUser)
+		return "", nil
+	}
+
 	if action == "archive" || action == "read" || action == "done" || action == "delete" {
 		if len(fields) < 2 {
 			return fmt.Sprintf("Usage: `%s <number> [number...]` or `%s all`", action, action), nil
@@ -919,6 +976,7 @@ func commandHelp() string {
 		"- `add icloud <name>` — add an iCloud account\n" +
 		"- `rename <old> <new>` — rename an account\n" +
 		"- `remove <name>` — remove an account\n" +
+		"- `timezone` — set your digest timezone (default: 7:00 AM UTC)\n" +
 		"\nTo create filters, use the **Create Filter...** button on any email card."
 }
 
