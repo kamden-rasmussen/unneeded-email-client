@@ -82,6 +82,7 @@ type User struct {
 	MattermostUser string   `yaml:"mattermost_user"`
 	Accounts       []string `yaml:"accounts"`      // names from the top-level accounts list
 	Preferences    string   `yaml:"preferences"`   // path to preferences file
+	Timezone       string   `yaml:"timezone"`      // IANA timezone, e.g. "America/Los_Angeles"
 }
 
 func Load(path string) (*Config, error) {
@@ -333,6 +334,41 @@ func EnsureUserIDs(path string, users []User) (bool, error) {
 	enc := yaml.NewEncoder(out)
 	enc.SetIndent(2)
 	return true, enc.Encode(&raw)
+}
+
+// SetUserTimezone reads the config at path, sets the timezone for the given Mattermost user, and writes it back.
+func SetUserTimezone(path, mattermostUser, tz string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("reading config: %w", err)
+	}
+	var raw Config
+	if err := yaml.NewDecoder(f).Decode(&raw); err != nil {
+		f.Close()
+		return fmt.Errorf("parsing config: %w", err)
+	}
+	f.Close()
+
+	found := false
+	for i := range raw.Users {
+		if raw.Users[i].MattermostUser == mattermostUser {
+			raw.Users[i].Timezone = tz
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("user %q not found in config", mattermostUser)
+	}
+
+	out, err := os.OpenFile(path, os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("writing config: %w", err)
+	}
+	defer out.Close()
+	enc := yaml.NewEncoder(out)
+	enc.SetIndent(2)
+	return enc.Encode(&raw)
 }
 
 func newUUID() string {

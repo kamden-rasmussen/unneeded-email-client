@@ -44,8 +44,11 @@ type Handler struct {
 	// OnAccountAdded, when set, is called after a new account is successfully added.
 	// It should trigger a digest for the new account so emails appear immediately.
 	OnAccountAdded func(accountName string)
-	pendingOAuths     sync.Map // state string → *pendingOAuth
-	pendingIMAPSetups sync.Map // token string → *imapPendingSetup
+	// SetTimezone persists a timezone for the given Mattermost user and reschedules their digest.
+	SetTimezone func(mattermostUser, tz string) error
+	pendingOAuths      sync.Map // state string → *pendingOAuth
+	pendingIMAPSetups  sync.Map // token string → *imapPendingSetup
+	pendingTZSetups    sync.Map // token string → *pendingTZSetup
 }
 
 // getMMForUser returns the Mattermost client for the given user, falling back to MMClient.
@@ -67,6 +70,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/setup/gmail/callback", h.handleGmailCallback)
 	mux.HandleFunc("/setup/imap/start", h.handleIMAPStart)
 	mux.HandleFunc("/setup/imap/form", h.handleIMAPForm)
+	mux.HandleFunc("/setup/timezone/form", h.handleTimezoneForm)
 }
 
 // StartGmailReauth generates an OAuth2 authorization URL for re-authorizing a Gmail account.
