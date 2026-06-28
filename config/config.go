@@ -19,15 +19,16 @@ type Config struct {
 }
 
 type Account struct {
-	Name            string `yaml:"name"`
-	Type            string `yaml:"type"` // "gmail" | "imap"
-	Email           string `yaml:"email"`
-	Host            string `yaml:"host"`
-	Port            int    `yaml:"port"`
-	Password        string `yaml:"password"`
-	ArchiveMailbox  string `yaml:"archive_mailbox"` // IMAP only; defaults to "Archive"
-	TrashMailbox    string `yaml:"trash_mailbox"`   // IMAP only; defaults to "Trash"
-	TokenFile string `yaml:"token_file"`
+	Name           string `yaml:"name"`
+	Type           string `yaml:"type"` // "gmail" | "imap"
+	Email          string `yaml:"email"`
+	Host           string `yaml:"host"`
+	Port           int    `yaml:"port"`
+	Password       string `yaml:"password"`
+	ArchiveMailbox string `yaml:"archive_mailbox"` // IMAP only; defaults to "Archive"
+	TrashMailbox   string `yaml:"trash_mailbox"`   // IMAP only; defaults to "Trash"
+	TokenFile      string `yaml:"token_file"`
+	TokenJSON      string `yaml:"-"` // runtime only: OAuth token loaded from DB
 }
 
 type Mattermost struct {

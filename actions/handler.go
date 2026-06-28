@@ -45,9 +45,11 @@ type Handler struct {
 	OnAccountAdded func(accountName string)
 	// SetTimezone persists a timezone for the given Mattermost user and reschedules their digest.
 	SetTimezone func(mattermostUser, tz string) error
-	pendingOAuths      sync.Map // state string → *pendingOAuth
-	pendingIMAPSetups  sync.Map // token string → *imapPendingSetup
-	pendingTZSetups    sync.Map // token string → *pendingTZSetup
+	// SaveToken persists a new OAuth token JSON for an account to the database.
+	SaveToken func(accountName, tokenJSON string) error
+	pendingOAuths     sync.Map // state string → *pendingOAuth
+	pendingIMAPSetups sync.Map // token string → *imapPendingSetup
+	pendingTZSetups   sync.Map // token string → *pendingTZSetup
 }
 
 // getMMForUser returns the Mattermost client for the given user, falling back to MMClient.
@@ -73,8 +75,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 }
 
 // StartGmailReauth generates an OAuth2 authorization URL for re-authorizing a Gmail account.
-// refresh is called after the new token is saved; its return value replaces the live client entry.
-func (h *Handler) StartGmailReauth(accountName, tokenFile string, refresh func() (email.Actioner, error)) (string, error) {
+// refresh is called with the new token JSON after the token is saved; its return value replaces the live client.
+func (h *Handler) StartGmailReauth(accountName string, refresh func(tokenJSON string) (email.Actioner, error)) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -87,7 +89,6 @@ func (h *Handler) StartGmailReauth(accountName, tokenFile string, refresh func()
 	}
 	h.pendingOAuths.Store(state, &pendingOAuth{
 		accountName: accountName,
-		tokenFile:   tokenFile,
 		expiresAt:   time.Now().Add(10 * time.Minute),
 		refresh:     refresh,
 	})

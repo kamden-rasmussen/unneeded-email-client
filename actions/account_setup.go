@@ -16,6 +16,16 @@ import (
 	"github.com/kamden/emailagent/notify"
 )
 
+// saveTokenFunc returns a closure that persists a refreshed OAuth token to the database.
+func (h *Handler) saveTokenFunc(accountName string) func(tokenJSON string) error {
+	return func(tokenJSON string) error {
+		if h.SaveToken != nil {
+			return h.SaveToken(accountName, tokenJSON)
+		}
+		return nil
+	}
+}
+
 // HandleRenameCommand processes a "rename <old> <new>" text command from the DM channel.
 func (h *Handler) HandleRenameCommand(oldName, newName string) {
 	if _, exists := h.Clients[oldName]; !exists {
@@ -77,8 +87,7 @@ func (h *Handler) HandleAddCommand(accountType, name string) {
 }
 
 func (h *Handler) handleAddGmail(name string) {
-	tokenFile := name + "_token.json"
-	acc := config.Account{Name: name, Type: "gmail", TokenFile: tokenFile}
+	acc := config.Account{Name: name, Type: "gmail"}
 
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -97,10 +106,12 @@ func (h *Handler) handleAddGmail(name string) {
 
 	h.pendingOAuths.Store(state, &pendingOAuth{
 		accountName: name,
-		tokenFile:   tokenFile,
 		expiresAt:   time.Now().Add(10 * time.Minute),
-		refresh:     func() (email.Actioner, error) { return email.NewGmailClient(acc) },
-		newAccount:  &acc,
+		refresh: func(tokenJSON string) (email.Actioner, error) {
+			acc.TokenJSON = tokenJSON
+			return email.NewGmailClient(acc, h.saveTokenFunc(name))
+		},
+		newAccount: &acc,
 	})
 
 	h.MMClient.PostMessage(fmt.Sprintf( //nolint:errcheck

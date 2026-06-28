@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -64,6 +65,17 @@ func main() {
 		log.Fatalf("database: %v", err)
 	}
 	defer db.Close()
+
+	if keyHex := os.Getenv("ENCRYPTION_KEY"); keyHex != "" {
+		key, err := hex.DecodeString(keyHex)
+		if err != nil || len(key) != 32 {
+			log.Fatalf("ENCRYPTION_KEY must be a 64-character hex string (32 bytes); got %d bytes", len(key))
+		}
+		db.SetEncryptionKey(key)
+		log.Printf("encryption enabled")
+	} else {
+		log.Printf("warning: ENCRYPTION_KEY not set — sensitive fields stored unencrypted")
+	}
 
 	if !db.IsConfigured() {
 		log.Fatalf("database %s is not configured — run: email-agent migrate -config config.yaml", *dbPathFlag)
@@ -130,17 +142,9 @@ func main() {
 				return nil
 			},
 			RenameAccount: func(oldName, newName string) error {
-				oldToken := oldName + "_token.json"
-				newToken := newName + "_token.json"
-				if _, err := os.Stat(oldToken); err == nil {
-					os.Rename(oldToken, newToken) //nolint:errcheck
-				}
 				for i := range cfg.Accounts {
 					if cfg.Accounts[i].Name == oldName {
 						cfg.Accounts[i].Name = newName
-						if cfg.Accounts[i].TokenFile == oldToken {
-							cfg.Accounts[i].TokenFile = newToken
-						}
 						break
 					}
 				}
@@ -151,8 +155,7 @@ func main() {
 				return db.RenameAccount(oldName, newName)
 			},
 			RemoveAccount: func(name string) error {
-				removed, err := db.DeleteAccount(name)
-				if err != nil {
+				if _, err := db.DeleteAccount(name); err != nil {
 					return err
 				}
 				// Remove from in-memory cfg and all client maps.
@@ -185,9 +188,6 @@ func main() {
 					delete(uctx.suggesters, name)
 					delete(uctx.counters, name)
 				}
-				if removed.TokenFile != "" {
-					os.Remove(removed.TokenFile) //nolint:errcheck
-				}
 				return nil
 			},
 			NextChunk: func(user, account string, offset int) error {
@@ -215,12 +215,9 @@ func main() {
 						if acc.Name != accountName {
 							continue
 						}
-						tokenFile := acc.TokenFile
-						if tokenFile == "" {
-							tokenFile = acc.Name + "_token.json"
-						}
-						url, err := ah.StartGmailReauth(acc.Name, tokenFile, func() (email.Actioner, error) {
-							return email.NewGmailClient(acc)
+						url, err := ah.StartGmailReauth(acc.Name, func(tokenJSON string) (email.Actioner, error) {
+							acc.TokenJSON = tokenJSON
+							return email.NewGmailClient(acc, db.SaveTokenFunc(acc.Name))
 						})
 						if err != nil {
 							log.Printf("trigger reauth for %s: %v", accountName, err)
@@ -324,6 +321,7 @@ func main() {
 			}
 			return nil
 		}
+		ah.SaveToken = db.UpdateAccountToken
 	}
 
 	c.Start()
@@ -365,7 +363,7 @@ func buildUserContexts(cfg *config.Config, users []config.User, db *storage.DB) 
 			prefs = &config.Preferences{Digest: config.DigestOpts{MaxPreviewLength: 150, VIPFirst: true}}
 		}
 
-		clients := buildActionClients(userAccounts)
+		clients := buildActionClients(userAccounts, db)
 		ctxs[u.ID] = &userCtx{
 			username:       u.ID,
 			mattermostUser: u.MattermostUser,
@@ -398,12 +396,9 @@ func digest(uctx *userCtx, cfg *config.Config, db *storage.DB, ah *actions.Handl
 			log.Printf("[%s] token expired but no callback_url configured for re-auth", acc.Name)
 			return
 		}
-		tokenFile := acc.TokenFile
-		if tokenFile == "" {
-			tokenFile = acc.Name + "_token.json"
-		}
-		url, err := ah.StartGmailReauth(acc.Name, tokenFile, func() (email.Actioner, error) {
-			return email.NewGmailClient(acc)
+		url, err := ah.StartGmailReauth(acc.Name, func(tokenJSON string) (email.Actioner, error) {
+			acc.TokenJSON = tokenJSON
+			return email.NewGmailClient(acc, db.SaveTokenFunc(acc.Name))
 		})
 		if err != nil {
 			log.Printf("start reauth for %s: %v", acc.Name, err)
@@ -537,7 +532,7 @@ func fetchAccount(acc config.Account, db *storage.DB) ([]email.Email, error) {
 	var c email.Client
 	switch acc.Type {
 	case "gmail":
-		c, err = email.NewGmailClient(acc)
+		c, err = email.NewGmailClient(acc, db.SaveTokenFunc(acc.Name))
 	case "imap":
 		c, err = email.NewIMAPClient(acc)
 	default:
@@ -661,7 +656,7 @@ func loadNextChunk(uctx *userCtx, account string, offset int, db *storage.DB) er
 	return uctx.mm.SendDigest(chunk, nil, nextOffsets, "")
 }
 
-func buildActionClients(accounts []config.Account) map[string]email.Actioner {
+func buildActionClients(accounts []config.Account, db *storage.DB) map[string]email.Actioner {
 	clients := make(map[string]email.Actioner)
 	for _, acc := range accounts {
 		var (
@@ -670,7 +665,7 @@ func buildActionClients(accounts []config.Account) map[string]email.Actioner {
 		)
 		switch acc.Type {
 		case "gmail":
-			c, err = email.NewGmailClient(acc)
+			c, err = email.NewGmailClient(acc, db.SaveTokenFunc(acc.Name))
 		case "imap":
 			c, err = email.NewIMAPClient(acc)
 		default:

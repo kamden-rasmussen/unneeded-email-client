@@ -17,7 +17,33 @@ import (
 var cryptoRandRead = rand.Read
 
 type DB struct {
-	db *sql.DB
+	db     *sql.DB
+	encKey []byte // AES-256 key for sensitive fields; nil means no encryption
+}
+
+// SetEncryptionKey sets the AES-256 key used to encrypt/decrypt sensitive fields.
+// Must be called before any reads or writes. key must be exactly 32 bytes.
+func (d *DB) SetEncryptionKey(key []byte) {
+	d.encKey = key
+}
+
+func (d *DB) enc(s string) string {
+	v, err := encryptField(d.encKey, s)
+	if err != nil {
+		// Encryption failure is a programming error (bad key length); log and fall through.
+		fmt.Printf("storage: encrypt field: %v\n", err)
+		return s
+	}
+	return v
+}
+
+func (d *DB) dec(s string) string {
+	v, err := decryptField(d.encKey, s)
+	if err != nil {
+		fmt.Printf("storage: decrypt field: %v\n", err)
+		return s
+	}
+	return v
 }
 
 // LabelSuggestion is a cached sender-domain → label mapping.
@@ -89,7 +115,8 @@ func Open(path string) (*DB, error) {
 			password         TEXT NOT NULL DEFAULT '',
 			archive_mailbox  TEXT NOT NULL DEFAULT '',
 			trash_mailbox    TEXT NOT NULL DEFAULT '',
-			token_file       TEXT NOT NULL DEFAULT ''
+			token_file       TEXT NOT NULL DEFAULT '',
+			token_json       TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE TABLE IF NOT EXISTS users (
 			id               TEXT PRIMARY KEY,
@@ -118,16 +145,29 @@ func Open(path string) (*DB, error) {
 
 // ---- app_settings ----
 
+// sensitiveSettingKeys lists app_settings keys whose values are encrypted at rest.
+var sensitiveSettingKeys = map[string]bool{
+	"mattermost.bot_token":      true,
+	"mattermost.webhook_secret": true,
+}
+
 func (d *DB) GetSetting(key, defaultVal string) string {
 	var v string
 	if err := d.db.QueryRow("SELECT value FROM app_settings WHERE key = ?", key).Scan(&v); err != nil {
 		return defaultVal
 	}
+	if sensitiveSettingKeys[key] {
+		return d.dec(v)
+	}
 	return v
 }
 
 func (d *DB) SetSetting(key, value string) error {
-	_, err := d.db.Exec("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", key, value)
+	stored := value
+	if sensitiveSettingKeys[key] {
+		stored = d.enc(value)
+	}
+	_, err := d.db.Exec("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", key, stored)
 	return err
 }
 
@@ -139,7 +179,7 @@ func (d *DB) IsConfigured() bool {
 // ---- accounts ----
 
 func (d *DB) GetAllAccounts() ([]config.Account, error) {
-	rows, err := d.db.Query("SELECT name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file FROM accounts ORDER BY name")
+	rows, err := d.db.Query("SELECT name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file, token_json FROM accounts ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -147,9 +187,11 @@ func (d *DB) GetAllAccounts() ([]config.Account, error) {
 	var accs []config.Account
 	for rows.Next() {
 		var a config.Account
-		if err := rows.Scan(&a.Name, &a.Type, &a.Email, &a.Host, &a.Port, &a.Password, &a.ArchiveMailbox, &a.TrashMailbox, &a.TokenFile); err != nil {
+		if err := rows.Scan(&a.Name, &a.Type, &a.Email, &a.Host, &a.Port, &a.Password, &a.ArchiveMailbox, &a.TrashMailbox, &a.TokenFile, &a.TokenJSON); err != nil {
 			return nil, err
 		}
+		a.Password = d.dec(a.Password)
+		a.TokenJSON = d.dec(a.TokenJSON)
 		accs = append(accs, a)
 	}
 	return accs, rows.Err()
@@ -157,18 +199,37 @@ func (d *DB) GetAllAccounts() ([]config.Account, error) {
 
 func (d *DB) GetAccount(name string) (config.Account, error) {
 	var a config.Account
-	err := d.db.QueryRow("SELECT name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file FROM accounts WHERE name = ?", name).
-		Scan(&a.Name, &a.Type, &a.Email, &a.Host, &a.Port, &a.Password, &a.ArchiveMailbox, &a.TrashMailbox, &a.TokenFile)
-	return a, err
+	err := d.db.QueryRow("SELECT name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file, token_json FROM accounts WHERE name = ?", name).
+		Scan(&a.Name, &a.Type, &a.Email, &a.Host, &a.Port, &a.Password, &a.ArchiveMailbox, &a.TrashMailbox, &a.TokenFile, &a.TokenJSON)
+	if err != nil {
+		return a, err
+	}
+	a.Password = d.dec(a.Password)
+	a.TokenJSON = d.dec(a.TokenJSON)
+	return a, nil
 }
 
 func (d *DB) UpsertAccount(acc config.Account) error {
 	_, err := d.db.Exec(
-		`INSERT OR REPLACE INTO accounts (name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		acc.Name, acc.Type, acc.Email, acc.Host, acc.Port, acc.Password, acc.ArchiveMailbox, acc.TrashMailbox, acc.TokenFile,
+		`INSERT OR REPLACE INTO accounts (name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file, token_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		acc.Name, acc.Type, acc.Email, acc.Host, acc.Port,
+		d.enc(acc.Password), acc.ArchiveMailbox, acc.TrashMailbox, acc.TokenFile, d.enc(acc.TokenJSON),
 	)
 	return err
+}
+
+// UpdateAccountToken stores a new OAuth token JSON for an account (encrypted if key is set).
+func (d *DB) UpdateAccountToken(name, tokenJSON string) error {
+	_, err := d.db.Exec("UPDATE accounts SET token_json = ? WHERE name = ?", d.enc(tokenJSON), name)
+	return err
+}
+
+// SaveTokenFunc returns a closure compatible with email.NewGmailClient's onSave parameter.
+func (d *DB) SaveTokenFunc(accountName string) func(tokenJSON string) error {
+	return func(tokenJSON string) error {
+		return d.UpdateAccountToken(accountName, tokenJSON)
+	}
 }
 
 func (d *DB) DeleteAccount(name string) (config.Account, error) {
@@ -201,8 +262,8 @@ func (d *DB) RenameAccount(oldName, newName string) error {
 	defer tx.Rollback() //nolint:errcheck
 
 	var a config.Account
-	if err := tx.QueryRow("SELECT name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file FROM accounts WHERE name = ?", oldName).
-		Scan(&a.Name, &a.Type, &a.Email, &a.Host, &a.Port, &a.Password, &a.ArchiveMailbox, &a.TrashMailbox, &a.TokenFile); err != nil {
+	if err := tx.QueryRow("SELECT name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file, token_json FROM accounts WHERE name = ?", oldName).
+		Scan(&a.Name, &a.Type, &a.Email, &a.Host, &a.Port, &a.Password, &a.ArchiveMailbox, &a.TrashMailbox, &a.TokenFile, &a.TokenJSON); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("account %q not found", oldName)
 		}
@@ -214,10 +275,11 @@ func (d *DB) RenameAccount(oldName, newName string) error {
 		tokenFile = newName + "_token.json"
 	}
 
+	// password and token_json are already stored encrypted — copy raw values directly.
 	if _, err := tx.Exec(
-		`INSERT OR REPLACE INTO accounts (name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		newName, a.Type, a.Email, a.Host, a.Port, a.Password, a.ArchiveMailbox, a.TrashMailbox, tokenFile,
+		`INSERT OR REPLACE INTO accounts (name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file, token_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		newName, a.Type, a.Email, a.Host, a.Port, a.Password, a.ArchiveMailbox, a.TrashMailbox, tokenFile, a.TokenJSON,
 	); err != nil {
 		return err
 	}
@@ -351,15 +413,15 @@ func (d *DB) SeedFromYAML(cfg *config.Config, defaultPrefsPath string) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// App settings.
+	// App settings — encrypt sensitive values before storing.
 	settings := map[string]string{
-		"mattermost.bot_token":      cfg.Mattermost.BotToken,
+		"mattermost.bot_token":      d.enc(cfg.Mattermost.BotToken),
 		"mattermost.server_url":     cfg.Mattermost.ServerURL,
 		"mattermost.dm_user":        cfg.Mattermost.DMUser,
 		"mattermost.username":       cfg.Mattermost.Username,
 		"mattermost.callback_url":   cfg.Mattermost.CallbackURL,
 		"mattermost.port":           strconv.Itoa(cfg.Mattermost.Port),
-		"mattermost.webhook_secret": cfg.Mattermost.WebhookSecret,
+		"mattermost.webhook_secret": d.enc(cfg.Mattermost.WebhookSecret),
 		"ollama.enabled":            strconv.FormatBool(cfg.Ollama.Enabled),
 		"ollama.host":               cfg.Ollama.Host,
 		"ollama.model":              cfg.Ollama.Model,
@@ -375,12 +437,19 @@ func (d *DB) SeedFromYAML(cfg *config.Config, defaultPrefsPath string) error {
 		}
 	}
 
-	// Accounts.
+	// Accounts — encrypt password and token_json.
+	// For Gmail accounts, also import the token file into the DB if present.
 	for _, acc := range cfg.Accounts {
+		if acc.Type == "gmail" && acc.TokenFile != "" && acc.TokenJSON == "" {
+			if raw, err := os.ReadFile(acc.TokenFile); err == nil {
+				acc.TokenJSON = string(raw)
+			}
+		}
 		if _, err := tx.Exec(
-			`INSERT OR IGNORE INTO accounts (name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			acc.Name, acc.Type, acc.Email, acc.Host, acc.Port, acc.Password, acc.ArchiveMailbox, acc.TrashMailbox, acc.TokenFile,
+			`INSERT OR IGNORE INTO accounts (name, type, email, host, port, password, archive_mailbox, trash_mailbox, token_file, token_json)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			acc.Name, acc.Type, acc.Email, acc.Host, acc.Port,
+			d.enc(acc.Password), acc.ArchiveMailbox, acc.TrashMailbox, acc.TokenFile, d.enc(acc.TokenJSON),
 		); err != nil {
 			return fmt.Errorf("seed account %s: %w", acc.Name, err)
 		}
@@ -493,6 +562,11 @@ func migrateSchema(db *sql.DB) {
 	// sender_suggestions: add user column if not present (added when multi-user support landed)
 	if db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sender_suggestions') WHERE name='user'`).Scan(&n) == nil && n == 0 {
 		db.Exec("ALTER TABLE sender_suggestions ADD COLUMN user TEXT NOT NULL DEFAULT ''") //nolint:errcheck
+	}
+
+	// accounts: add token_json column if not present (DB-stored OAuth tokens)
+	if db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name='token_json'`).Scan(&n) == nil && n == 0 {
+		db.Exec("ALTER TABLE accounts ADD COLUMN token_json TEXT NOT NULL DEFAULT ''") //nolint:errcheck
 	}
 }
 
