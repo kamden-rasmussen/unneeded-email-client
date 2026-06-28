@@ -25,10 +25,8 @@ import (
 )
 
 var (
-	configPath  = flag.String("config", "config.yaml", "path to YAML config (used only for initial DB seed)")
-	prefsPath   = flag.String("prefs", "preferences.yaml", "path to YAML preferences (used only for initial DB seed)")
-	dbPathFlag  = flag.String("db", "", "path to SQLite database (overrides config)")
-	runNow      = flag.Bool("now", false, "run digest immediately")
+	dbPathFlag = flag.String("db", "email_agent.db", "path to SQLite database")
+	runNow     = flag.Bool("now", false, "run digest immediately")
 )
 
 // userCtx holds all per-user state: Mattermost channel, email clients, preferences, and AI processor.
@@ -48,41 +46,27 @@ type userCtx struct {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "auth" {
-		runAuth(os.Args[2:])
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "auth":
+			runAuth(os.Args[2:])
+			return
+		case "migrate":
+			runMigrate(os.Args[2:])
+			return
+		}
 	}
 
 	flag.Parse()
 
-	// Open database first. DB path comes from flag default or config file.
-	dbPath := *dbPathFlag
-	if dbPath == "" {
-		// Fall back to reading only the database field from YAML if present.
-		if raw, err := config.Load(*configPath); err == nil && raw.Database != "" {
-			dbPath = raw.Database
-		} else {
-			dbPath = "email_agent.db"
-		}
-	}
-
-	db, err := storage.Open(dbPath)
+	db, err := storage.Open(*dbPathFlag)
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
 	defer db.Close()
 
-	// Seed from YAML on first run if the DB has no configuration yet.
 	if !db.IsConfigured() {
-		log.Printf("database not configured — seeding from %s", *configPath)
-		yamlCfg, err := config.Load(*configPath)
-		if err != nil {
-			log.Fatalf("config seed: %v (delete or fix %s, or populate the database manually)", err, *configPath)
-		}
-		if err := db.SeedFromYAML(yamlCfg, *prefsPath); err != nil {
-			log.Fatalf("seed database: %v", err)
-		}
-		log.Printf("database seeded from %s", *configPath)
+		log.Fatalf("database %s is not configured — run: email-agent migrate -config config.yaml", *dbPathFlag)
 	}
 
 	cfg, err := db.LoadConfig()
@@ -1019,8 +1003,44 @@ func runAuth(args []string) {
 		if err := email.RunGmailAuth(tokenFile, *port); err != nil {
 			log.Fatalf("auth: %v", err)
 		}
-		fmt.Printf("\nAdd this to your config.yaml:\n\n  - name: %s\n    type: gmail\n    email: you@gmail.com\n", name)
+		fmt.Printf("Done. Use `email-agent migrate` to add this account to the database.\n")
 	default:
 		log.Fatalf("unknown account type %q — supported: gmail", accountType)
 	}
+}
+
+// runMigrate handles the `email-agent migrate` subcommand, which seeds the database
+// from a YAML config file. This is a one-time operation for existing deployments.
+func runMigrate(args []string) {
+	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
+	configPath := fs.String("config", "config.yaml", "path to YAML config file")
+	prefsPath := fs.String("prefs", "preferences.yaml", "path to YAML preferences file")
+	dbPath := fs.String("db", "email_agent.db", "path to SQLite database")
+	fs.Parse(args) //nolint:errcheck
+
+	yamlCfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("migrate: reading %s: %v", *configPath, err)
+	}
+
+	db, err := storage.Open(*dbPath)
+	if err != nil {
+		log.Fatalf("migrate: opening database: %v", err)
+	}
+	defer db.Close()
+
+	if db.IsConfigured() {
+		fmt.Printf("Database %s is already configured — nothing to migrate.\n", *dbPath)
+		fmt.Println("To re-seed, delete the database and run migrate again.")
+		return
+	}
+
+	if err := db.SeedFromYAML(yamlCfg, *prefsPath); err != nil {
+		log.Fatalf("migrate: seeding database: %v", err)
+	}
+
+	accounts, _ := db.GetAllAccounts()
+	users, _ := db.GetAllUsers()
+	fmt.Printf("Migration complete: %d account(s), %d user(s) written to %s\n",
+		len(accounts), len(users), *dbPath)
 }
