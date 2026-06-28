@@ -68,8 +68,11 @@ func main() {
 
 	if keyHex := os.Getenv("ENCRYPTION_KEY"); keyHex != "" {
 		key, err := hex.DecodeString(keyHex)
-		if err != nil || len(key) != 32 {
-			log.Fatalf("ENCRYPTION_KEY must be a 64-character hex string (32 bytes); got %d bytes", len(key))
+		if err != nil {
+			log.Fatalf("ENCRYPTION_KEY is not valid hex: %v", err)
+		}
+		if len(key) != 32 {
+			log.Fatalf("ENCRYPTION_KEY must decode to exactly 32 bytes (64 hex chars); got %d bytes", len(key))
 		}
 		db.SetEncryptionKey(key)
 		log.Printf("encryption enabled")
