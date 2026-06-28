@@ -25,26 +25,26 @@ import (
 )
 
 var (
-	configPath = flag.String("config", "config.yaml", "path to config file")
-	prefsPath  = flag.String("prefs", "preferences.yaml", "path to preferences file")
-	runNow     = flag.Bool("now", false, "run digest immediately")
+	configPath  = flag.String("config", "config.yaml", "path to YAML config (used only for initial DB seed)")
+	prefsPath   = flag.String("prefs", "preferences.yaml", "path to YAML preferences (used only for initial DB seed)")
+	dbPathFlag  = flag.String("db", "", "path to SQLite database (overrides config)")
+	runNow      = flag.Bool("now", false, "run digest immediately")
 )
 
 // userCtx holds all per-user state: Mattermost channel, email clients, preferences, and AI processor.
 type userCtx struct {
-	username        string
-	mattermostUser  string
-	mm              *notify.Mattermost
-	prefs           *config.Preferences
-	prefsPath       string
-	proc            *ai.Processor // carries per-user prefs for IsVIP/IsMuted/Categorize
-	clients         map[string]email.Actioner
-	suggesters      map[string]email.Suggester
-	counters        map[string]email.Counter
-	accounts        []config.Account
-	digestMu        sync.Mutex
-	timezone        string       // IANA timezone for digest scheduling, e.g. "America/Los_Angeles"
-	cronEntryID     cron.EntryID // current cron entry; 0 if not scheduled yet
+	username       string
+	mattermostUser string
+	mm             *notify.Mattermost
+	prefs          *config.Preferences
+	proc           *ai.Processor // carries per-user prefs for IsVIP/IsMuted/Categorize
+	clients        map[string]email.Actioner
+	suggesters     map[string]email.Suggester
+	counters       map[string]email.Counter
+	accounts       []config.Account
+	digestMu       sync.Mutex
+	timezone       string       // IANA timezone for digest scheduling, e.g. "America/Los_Angeles"
+	cronEntryID    cron.EntryID // current cron entry; 0 if not scheduled yet
 }
 
 func main() {
@@ -55,28 +55,47 @@ func main() {
 
 	flag.Parse()
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatalf("config: %v", err)
+	// Open database first. DB path comes from flag default or config file.
+	dbPath := *dbPathFlag
+	if dbPath == "" {
+		// Fall back to reading only the database field from YAML if present.
+		if raw, err := config.Load(*configPath); err == nil && raw.Database != "" {
+			dbPath = raw.Database
+		} else {
+			dbPath = "email_agent.db"
+		}
 	}
 
-	db, err := storage.Open(cfg.Database)
+	db, err := storage.Open(dbPath)
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
 	defer db.Close()
 
-	users := cfg.EffectiveUsers(*prefsPath)
-	if len(users) == 0 {
-		log.Fatal("no users configured — add a 'users' section or set mattermost.dm_user")
-	}
-	if generated, err := config.EnsureUserIDs(*configPath, users); err != nil {
-		log.Printf("warning: could not persist user IDs: %v", err)
-	} else if generated {
-		log.Printf("generated UUIDs for new user(s) — saved to config")
+	// Seed from YAML on first run if the DB has no configuration yet.
+	if !db.IsConfigured() {
+		log.Printf("database not configured — seeding from %s", *configPath)
+		yamlCfg, err := config.Load(*configPath)
+		if err != nil {
+			log.Fatalf("config seed: %v (delete or fix %s, or populate the database manually)", err, *configPath)
+		}
+		if err := db.SeedFromYAML(yamlCfg, *prefsPath); err != nil {
+			log.Fatalf("seed database: %v", err)
+		}
+		log.Printf("database seeded from %s", *configPath)
 	}
 
-	userCtxs := buildUserContexts(cfg, users)
+	cfg, err := db.LoadConfig()
+	if err != nil {
+		log.Fatalf("load config from db: %v", err)
+	}
+
+	users := cfg.Users
+	if len(users) == 0 {
+		log.Fatal("no users configured — seed the database or add users via the bot")
+	}
+
+	userCtxs := buildUserContexts(cfg, users, db)
 
 	// Union of all clients across users for button-callback routing.
 	allClients := make(map[string]email.Actioner)
@@ -100,17 +119,17 @@ func main() {
 			CallbackURL:   cfg.Mattermost.CallbackURL,
 			DB:            db,
 			WebhookSecret: cfg.Mattermost.WebhookSecret,
-			ConfigPath:    *configPath,
 			AddAccount: func(acc config.Account, client email.Actioner) error {
-				if err := config.AppendAccount(*configPath, acc); err != nil {
+				if err := db.UpsertAccount(acc); err != nil {
 					return err
 				}
 				cfg.Accounts = append(cfg.Accounts, acc)
 				allClients[acc.Name] = client
-				// Keep in-memory user account lists in sync with config.
+				// Add account to every user that has an explicit list.
 				for i := range users {
 					if len(users[i].Accounts) > 0 {
 						users[i].Accounts = append(users[i].Accounts, acc.Name)
+						db.AddUserAccount(users[i].ID, acc.Name) //nolint:errcheck
 					}
 				}
 				// Update live user contexts so the new account appears in the next digest.
@@ -145,10 +164,10 @@ func main() {
 					allClients[newName] = c
 					delete(allClients, oldName)
 				}
-				return config.RenameAccount(*configPath, oldName, newName)
+				return db.RenameAccount(oldName, newName)
 			},
 			RemoveAccount: func(name string) error {
-				removed, err := config.RemoveAccount(*configPath, name)
+				removed, err := db.DeleteAccount(name)
 				if err != nil {
 					return err
 				}
@@ -182,7 +201,6 @@ func main() {
 					delete(uctx.suggesters, name)
 					delete(uctx.counters, name)
 				}
-				// Delete token file if it's the default pattern.
 				if removed.TokenFile != "" {
 					os.Remove(removed.TokenFile) //nolint:errcheck
 				}
@@ -310,7 +328,7 @@ func main() {
 			if _, err := time.LoadLocation(tz); err != nil {
 				return fmt.Errorf("unknown timezone %q", tz)
 			}
-			if err := config.SetUserTimezone(*configPath, mattermostUser, tz); err != nil {
+			if err := db.SetUserTimezone(mattermostUser, tz); err != nil {
 				return err
 			}
 			for _, uctx := range userCtxs {
@@ -336,7 +354,7 @@ func main() {
 	log.Println("shutting down")
 }
 
-func buildUserContexts(cfg *config.Config, users []config.User) map[string]*userCtx {
+func buildUserContexts(cfg *config.Config, users []config.User, db *storage.DB) map[string]*userCtx {
 	accountByName := make(map[string]config.Account)
 	for _, a := range cfg.Accounts {
 		accountByName[a.Name] = a
@@ -352,12 +370,12 @@ func buildUserContexts(cfg *config.Config, users []config.User) map[string]*user
 				if acc, ok := accountByName[name]; ok {
 					userAccounts = append(userAccounts, acc)
 				} else {
-					log.Printf("[%s] account %q not found in config", u.ID, name)
+					log.Printf("[%s] account %q not found in db", u.ID, name)
 				}
 			}
 		}
 
-		prefs, err := config.LoadPreferences(u.Preferences)
+		prefs, err := db.LoadUserPreferences(u.ID)
 		if err != nil {
 			log.Printf("[%s] preferences: %v — using defaults", u.ID, err)
 			prefs = &config.Preferences{Digest: config.DigestOpts{MaxPreviewLength: 150, VIPFirst: true}}
@@ -369,7 +387,6 @@ func buildUserContexts(cfg *config.Config, users []config.User) map[string]*user
 			mattermostUser: u.MattermostUser,
 			mm:             notify.NewMattermostForUser(cfg.Mattermost, u.MattermostUser),
 			prefs:          prefs,
-			prefsPath:      u.Preferences,
 			proc:           ai.New(cfg.Ollama, prefs),
 			clients:        clients,
 			suggesters:     buildSuggesters(clients),

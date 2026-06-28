@@ -27,7 +27,6 @@ type Handler struct {
 	CallbackURL   string
 	DB            *storage.DB // for recording user-confirmed sender→label mappings
 	WebhookSecret string
-	ConfigPath    string
 	// AddAccount is called when a new account is fully set up; it should persist
 	// the account to config and update any live state in main (e.g. suggesters).
 	AddAccount func(acc config.Account, client email.Actioner) error
