@@ -1,6 +1,7 @@
 package actions
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,10 +13,9 @@ import (
 
 type pendingOAuth struct {
 	accountName string
-	tokenFile   string
 	expiresAt   time.Time
-	// refresh is called after the token is saved; its return value replaces the live client.
-	refresh func() (email.Actioner, error)
+	// refresh is called with the new token JSON; its return value replaces the live client.
+	refresh func(tokenJSON string) (email.Actioner, error)
 	// newAccount is set when adding a brand-new account (not a re-auth).
 	// After the client is created, AddAccount is called to persist it.
 	newAccount *config.Account
@@ -50,15 +50,25 @@ func (h *Handler) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := email.SaveToken(pending.tokenFile, tok); err != nil {
-		log.Printf("save token %s: %v", pending.tokenFile, err)
-		http.Error(w, "Failed to save token.", http.StatusInternalServerError)
+	tokenBytes, err := json.Marshal(tok)
+	if err != nil {
+		log.Printf("marshal token for %s: %v", pending.accountName, err)
+		http.Error(w, "Failed to process token.", http.StatusInternalServerError)
 		return
+	}
+	tokenJSON := string(tokenBytes)
+
+	if h.SaveToken != nil {
+		if err := h.SaveToken(pending.accountName, tokenJSON); err != nil {
+			log.Printf("save token to db for %s: %v", pending.accountName, err)
+			http.Error(w, "Failed to save token.", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Swap in a fresh client so button actions stop getting invalid_grant.
 	if pending.refresh != nil {
-		if newClient, err := pending.refresh(); err == nil {
+		if newClient, err := pending.refresh(tokenJSON); err == nil {
 			h.Clients[pending.accountName] = newClient
 			if pending.newAccount != nil && h.AddAccount != nil {
 				// Populate the email address from the Gmail API before persisting.

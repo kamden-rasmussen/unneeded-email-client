@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -25,58 +26,75 @@ import (
 )
 
 var (
-	configPath = flag.String("config", "config.yaml", "path to config file")
-	prefsPath  = flag.String("prefs", "preferences.yaml", "path to preferences file")
+	dbPathFlag = flag.String("db", "email_agent.db", "path to SQLite database")
 	runNow     = flag.Bool("now", false, "run digest immediately")
 )
 
 // userCtx holds all per-user state: Mattermost channel, email clients, preferences, and AI processor.
 type userCtx struct {
-	username        string
-	mattermostUser  string
-	mm              *notify.Mattermost
-	prefs           *config.Preferences
-	prefsPath       string
-	proc            *ai.Processor // carries per-user prefs for IsVIP/IsMuted/Categorize
-	clients         map[string]email.Actioner
-	suggesters      map[string]email.Suggester
-	counters        map[string]email.Counter
-	accounts        []config.Account
-	digestMu        sync.Mutex
-	timezone        string       // IANA timezone for digest scheduling, e.g. "America/Los_Angeles"
-	cronEntryID     cron.EntryID // current cron entry; 0 if not scheduled yet
+	username       string
+	mattermostUser string
+	mm             *notify.Mattermost
+	prefs          *config.Preferences
+	proc           *ai.Processor // carries per-user prefs for IsVIP/IsMuted/Categorize
+	clients        map[string]email.Actioner
+	suggesters     map[string]email.Suggester
+	counters       map[string]email.Counter
+	accounts       []config.Account
+	digestMu       sync.Mutex
+	timezone       string       // IANA timezone for digest scheduling, e.g. "America/Los_Angeles"
+	cronEntryID    cron.EntryID // current cron entry; 0 if not scheduled yet
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "auth" {
-		runAuth(os.Args[2:])
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "auth":
+			runAuth(os.Args[2:])
+			return
+		case "migrate":
+			runMigrate(os.Args[2:])
+			return
+		}
 	}
 
 	flag.Parse()
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatalf("config: %v", err)
-	}
-
-	db, err := storage.Open(cfg.Database)
+	db, err := storage.Open(*dbPathFlag)
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
 	defer db.Close()
 
-	users := cfg.EffectiveUsers(*prefsPath)
-	if len(users) == 0 {
-		log.Fatal("no users configured — add a 'users' section or set mattermost.dm_user")
-	}
-	if generated, err := config.EnsureUserIDs(*configPath, users); err != nil {
-		log.Printf("warning: could not persist user IDs: %v", err)
-	} else if generated {
-		log.Printf("generated UUIDs for new user(s) — saved to config")
+	if keyHex := os.Getenv("ENCRYPTION_KEY"); keyHex != "" {
+		key, err := hex.DecodeString(keyHex)
+		if err != nil {
+			log.Fatalf("ENCRYPTION_KEY is not valid hex: %v", err)
+		}
+		if len(key) != 32 {
+			log.Fatalf("ENCRYPTION_KEY must decode to exactly 32 bytes (64 hex chars); got %d bytes", len(key))
+		}
+		db.SetEncryptionKey(key)
+		log.Printf("encryption enabled")
+	} else {
+		log.Printf("warning: ENCRYPTION_KEY not set — sensitive fields stored unencrypted")
 	}
 
-	userCtxs := buildUserContexts(cfg, users)
+	if !db.IsConfigured() {
+		log.Fatalf("database %s is not configured — run: email-agent migrate -config config.yaml", *dbPathFlag)
+	}
+
+	cfg, err := db.LoadConfig()
+	if err != nil {
+		log.Fatalf("load config from db: %v", err)
+	}
+
+	users := cfg.Users
+	if len(users) == 0 {
+		log.Fatal("no users configured — seed the database or add users via the bot")
+	}
+
+	userCtxs := buildUserContexts(cfg, users, db)
 
 	// Union of all clients across users for button-callback routing.
 	allClients := make(map[string]email.Actioner)
@@ -100,17 +118,17 @@ func main() {
 			CallbackURL:   cfg.Mattermost.CallbackURL,
 			DB:            db,
 			WebhookSecret: cfg.Mattermost.WebhookSecret,
-			ConfigPath:    *configPath,
 			AddAccount: func(acc config.Account, client email.Actioner) error {
-				if err := config.AppendAccount(*configPath, acc); err != nil {
+				if err := db.UpsertAccount(acc); err != nil {
 					return err
 				}
 				cfg.Accounts = append(cfg.Accounts, acc)
 				allClients[acc.Name] = client
-				// Keep in-memory user account lists in sync with config.
+				// Add account to every user that has an explicit list.
 				for i := range users {
 					if len(users[i].Accounts) > 0 {
 						users[i].Accounts = append(users[i].Accounts, acc.Name)
+						db.AddUserAccount(users[i].ID, acc.Name) //nolint:errcheck
 					}
 				}
 				// Update live user contexts so the new account appears in the next digest.
@@ -127,17 +145,9 @@ func main() {
 				return nil
 			},
 			RenameAccount: func(oldName, newName string) error {
-				oldToken := oldName + "_token.json"
-				newToken := newName + "_token.json"
-				if _, err := os.Stat(oldToken); err == nil {
-					os.Rename(oldToken, newToken) //nolint:errcheck
-				}
 				for i := range cfg.Accounts {
 					if cfg.Accounts[i].Name == oldName {
 						cfg.Accounts[i].Name = newName
-						if cfg.Accounts[i].TokenFile == oldToken {
-							cfg.Accounts[i].TokenFile = newToken
-						}
 						break
 					}
 				}
@@ -145,11 +155,10 @@ func main() {
 					allClients[newName] = c
 					delete(allClients, oldName)
 				}
-				return config.RenameAccount(*configPath, oldName, newName)
+				return db.RenameAccount(oldName, newName)
 			},
 			RemoveAccount: func(name string) error {
-				removed, err := config.RemoveAccount(*configPath, name)
-				if err != nil {
+				if _, err := db.DeleteAccount(name); err != nil {
 					return err
 				}
 				// Remove from in-memory cfg and all client maps.
@@ -182,10 +191,6 @@ func main() {
 					delete(uctx.suggesters, name)
 					delete(uctx.counters, name)
 				}
-				// Delete token file if it's the default pattern.
-				if removed.TokenFile != "" {
-					os.Remove(removed.TokenFile) //nolint:errcheck
-				}
 				return nil
 			},
 			NextChunk: func(user, account string, offset int) error {
@@ -213,12 +218,9 @@ func main() {
 						if acc.Name != accountName {
 							continue
 						}
-						tokenFile := acc.TokenFile
-						if tokenFile == "" {
-							tokenFile = acc.Name + "_token.json"
-						}
-						url, err := ah.StartGmailReauth(acc.Name, tokenFile, func() (email.Actioner, error) {
-							return email.NewGmailClient(acc)
+						url, err := ah.StartGmailReauth(acc.Name, func(tokenJSON string) (email.Actioner, error) {
+							acc.TokenJSON = tokenJSON
+							return email.NewGmailClient(acc, db.SaveTokenFunc(acc.Name))
 						})
 						if err != nil {
 							log.Printf("trigger reauth for %s: %v", accountName, err)
@@ -310,7 +312,7 @@ func main() {
 			if _, err := time.LoadLocation(tz); err != nil {
 				return fmt.Errorf("unknown timezone %q", tz)
 			}
-			if err := config.SetUserTimezone(*configPath, mattermostUser, tz); err != nil {
+			if err := db.SetUserTimezone(mattermostUser, tz); err != nil {
 				return err
 			}
 			for _, uctx := range userCtxs {
@@ -322,6 +324,7 @@ func main() {
 			}
 			return nil
 		}
+		ah.SaveToken = db.UpdateAccountToken
 	}
 
 	c.Start()
@@ -336,7 +339,7 @@ func main() {
 	log.Println("shutting down")
 }
 
-func buildUserContexts(cfg *config.Config, users []config.User) map[string]*userCtx {
+func buildUserContexts(cfg *config.Config, users []config.User, db *storage.DB) map[string]*userCtx {
 	accountByName := make(map[string]config.Account)
 	for _, a := range cfg.Accounts {
 		accountByName[a.Name] = a
@@ -352,24 +355,23 @@ func buildUserContexts(cfg *config.Config, users []config.User) map[string]*user
 				if acc, ok := accountByName[name]; ok {
 					userAccounts = append(userAccounts, acc)
 				} else {
-					log.Printf("[%s] account %q not found in config", u.ID, name)
+					log.Printf("[%s] account %q not found in db", u.ID, name)
 				}
 			}
 		}
 
-		prefs, err := config.LoadPreferences(u.Preferences)
+		prefs, err := db.LoadUserPreferences(u.ID)
 		if err != nil {
 			log.Printf("[%s] preferences: %v — using defaults", u.ID, err)
 			prefs = &config.Preferences{Digest: config.DigestOpts{MaxPreviewLength: 150, VIPFirst: true}}
 		}
 
-		clients := buildActionClients(userAccounts)
+		clients := buildActionClients(userAccounts, db)
 		ctxs[u.ID] = &userCtx{
 			username:       u.ID,
 			mattermostUser: u.MattermostUser,
 			mm:             notify.NewMattermostForUser(cfg.Mattermost, u.MattermostUser),
 			prefs:          prefs,
-			prefsPath:      u.Preferences,
 			proc:           ai.New(cfg.Ollama, prefs),
 			clients:        clients,
 			suggesters:     buildSuggesters(clients),
@@ -397,12 +399,9 @@ func digest(uctx *userCtx, cfg *config.Config, db *storage.DB, ah *actions.Handl
 			log.Printf("[%s] token expired but no callback_url configured for re-auth", acc.Name)
 			return
 		}
-		tokenFile := acc.TokenFile
-		if tokenFile == "" {
-			tokenFile = acc.Name + "_token.json"
-		}
-		url, err := ah.StartGmailReauth(acc.Name, tokenFile, func() (email.Actioner, error) {
-			return email.NewGmailClient(acc)
+		url, err := ah.StartGmailReauth(acc.Name, func(tokenJSON string) (email.Actioner, error) {
+			acc.TokenJSON = tokenJSON
+			return email.NewGmailClient(acc, db.SaveTokenFunc(acc.Name))
 		})
 		if err != nil {
 			log.Printf("start reauth for %s: %v", acc.Name, err)
@@ -536,7 +535,7 @@ func fetchAccount(acc config.Account, db *storage.DB) ([]email.Email, error) {
 	var c email.Client
 	switch acc.Type {
 	case "gmail":
-		c, err = email.NewGmailClient(acc)
+		c, err = email.NewGmailClient(acc, db.SaveTokenFunc(acc.Name))
 	case "imap":
 		c, err = email.NewIMAPClient(acc)
 	default:
@@ -660,7 +659,7 @@ func loadNextChunk(uctx *userCtx, account string, offset int, db *storage.DB) er
 	return uctx.mm.SendDigest(chunk, nil, nextOffsets, "")
 }
 
-func buildActionClients(accounts []config.Account) map[string]email.Actioner {
+func buildActionClients(accounts []config.Account, db *storage.DB) map[string]email.Actioner {
 	clients := make(map[string]email.Actioner)
 	for _, acc := range accounts {
 		var (
@@ -669,7 +668,7 @@ func buildActionClients(accounts []config.Account) map[string]email.Actioner {
 		)
 		switch acc.Type {
 		case "gmail":
-			c, err = email.NewGmailClient(acc)
+			c, err = email.NewGmailClient(acc, db.SaveTokenFunc(acc.Name))
 		case "imap":
 			c, err = email.NewIMAPClient(acc)
 		default:
@@ -1002,8 +1001,44 @@ func runAuth(args []string) {
 		if err := email.RunGmailAuth(tokenFile, *port); err != nil {
 			log.Fatalf("auth: %v", err)
 		}
-		fmt.Printf("\nAdd this to your config.yaml:\n\n  - name: %s\n    type: gmail\n    email: you@gmail.com\n", name)
+		fmt.Printf("Done. Use `email-agent migrate` to add this account to the database.\n")
 	default:
 		log.Fatalf("unknown account type %q — supported: gmail", accountType)
 	}
+}
+
+// runMigrate handles the `email-agent migrate` subcommand, which seeds the database
+// from a YAML config file. This is a one-time operation for existing deployments.
+func runMigrate(args []string) {
+	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
+	configPath := fs.String("config", "config.yaml", "path to YAML config file")
+	prefsPath := fs.String("prefs", "preferences.yaml", "path to YAML preferences file")
+	dbPath := fs.String("db", "email_agent.db", "path to SQLite database")
+	fs.Parse(args) //nolint:errcheck
+
+	yamlCfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("migrate: reading %s: %v", *configPath, err)
+	}
+
+	db, err := storage.Open(*dbPath)
+	if err != nil {
+		log.Fatalf("migrate: opening database: %v", err)
+	}
+	defer db.Close()
+
+	if db.IsConfigured() {
+		fmt.Printf("Database %s is already configured — nothing to migrate.\n", *dbPath)
+		fmt.Println("To re-seed, delete the database and run migrate again.")
+		return
+	}
+
+	if err := db.SeedFromYAML(yamlCfg, *prefsPath); err != nil {
+		log.Fatalf("migrate: seeding database: %v", err)
+	}
+
+	accounts, _ := db.GetAllAccounts()
+	users, _ := db.GetAllUsers()
+	fmt.Printf("Migration complete: %d account(s), %d user(s) written to %s\n",
+		len(accounts), len(users), *dbPath)
 }

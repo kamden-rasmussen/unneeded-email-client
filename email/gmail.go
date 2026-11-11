@@ -40,17 +40,24 @@ type GmailClient struct {
 	labels []Label // in-process cache populated on first ListLabels call
 }
 
-func NewGmailClient(acc config.Account) (*GmailClient, error) {
-	tokenFile := acc.TokenFile
-	if tokenFile == "" {
-		tokenFile = acc.Name + "_token.json"
-	}
-
+// NewGmailClient creates a Gmail client. onSave is called with the refreshed token JSON
+// whenever the OAuth token is renewed; pass nil to skip saving (e.g. in tests or auth subcommand).
+func NewGmailClient(acc config.Account, onSave func(tokenJSON string) error) (*GmailClient, error) {
 	oauthCfg, err := gmailOAuthConfig()
 	if err != nil {
 		return nil, err
 	}
-	httpClient, err := oauthHTTPClient(oauthCfg, tokenFile)
+
+	var httpClient *http.Client
+	if acc.TokenJSON != "" {
+		httpClient, err = oauthHTTPClientFromJSON(oauthCfg, acc.TokenJSON, onSave)
+	} else {
+		tokenFile := acc.TokenFile
+		if tokenFile == "" {
+			tokenFile = acc.Name + "_token.json"
+		}
+		httpClient, err = oauthHTTPClientFromFile(oauthCfg, tokenFile, onSave)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("oauth for %s: %w", acc.Name, err)
 	}
@@ -61,6 +68,28 @@ func NewGmailClient(acc config.Account) (*GmailClient, error) {
 	}
 
 	return &GmailClient{cfg: acc, svc: svc}, nil
+}
+
+// savingTokenSource wraps an oauth2.TokenSource and calls save whenever a new token is issued.
+type savingTokenSource struct {
+	src  oauth2.TokenSource
+	save func(tokenJSON string) error
+	last string // last access token seen; avoids redundant saves
+}
+
+func (s *savingTokenSource) Token() (*oauth2.Token, error) {
+	tok, err := s.src.Token()
+	if err != nil {
+		return nil, err
+	}
+	if tok.AccessToken != s.last {
+		s.last = tok.AccessToken
+		if s.save != nil {
+			b, _ := json.Marshal(tok)
+			s.save(string(b)) //nolint:errcheck
+		}
+	}
+	return tok, nil
 }
 
 func (g *GmailClient) Name() string { return g.cfg.Name }
@@ -438,8 +467,21 @@ func (g *GmailClient) CreateSenderFilter(from string, addLabels, removeLabels []
 	return err
 }
 
-// oauthHTTPClient loads a saved token or runs the browser auth flow.
-func oauthHTTPClient(cfg *oauth2.Config, tokenFile string) (*http.Client, error) {
+// oauthHTTPClientFromJSON builds an OAuth HTTP client from a token JSON string stored in the DB.
+func oauthHTTPClientFromJSON(cfg *oauth2.Config, tokenJSON string, onSave func(string) error) (*http.Client, error) {
+	tok := &oauth2.Token{}
+	if err := json.Unmarshal([]byte(tokenJSON), tok); err != nil {
+		return nil, fmt.Errorf("parse token json: %w", err)
+	}
+	ts := cfg.TokenSource(context.Background(), tok)
+	if onSave != nil {
+		ts = &savingTokenSource{src: ts, save: onSave}
+	}
+	return oauth2.NewClient(context.Background(), ts), nil
+}
+
+// oauthHTTPClientFromFile loads a token from a file (legacy / auth subcommand path).
+func oauthHTTPClientFromFile(cfg *oauth2.Config, tokenFile string, onSave func(string) error) (*http.Client, error) {
 	tok, err := loadToken(tokenFile)
 	if err != nil {
 		tok, err = browserAuthFlow(cfg, 0)
@@ -450,7 +492,11 @@ func oauthHTTPClient(cfg *oauth2.Config, tokenFile string) (*http.Client, error)
 			return nil, err
 		}
 	}
-	return cfg.Client(context.Background(), tok), nil
+	ts := cfg.TokenSource(context.Background(), tok)
+	if onSave != nil {
+		ts = &savingTokenSource{src: ts, save: onSave}
+	}
+	return oauth2.NewClient(context.Background(), ts), nil
 }
 
 func loadToken(file string) (*oauth2.Token, error) {
